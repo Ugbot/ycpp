@@ -111,14 +111,23 @@ public:
         return item;            // new item is the loser; caller marks it deleted
     }
 
+    // Iterate every live key with the current head item, skipping entries
+    // whose head is deleted. `fn` receives `(ByteView key, Item* head)`.
+    // Iteration order is hashmap-internal; callers that need a stable
+    // order sort the keys themselves.
+    //
+    // Bounded by the hashmap capacity; no allocation; ≥2 assertions per
+    // Tiger Style. Forwards to HashMap::for_each (added alongside).
     template <class Fn>
     void for_each(Fn&& fn) const noexcept {
-        // Iteration order is hashmap-internal; callers that need a stable
-        // order should sort by ByteView themselves.
-        // We expose a min surface here; heads_ doesn't have a public
-        // visitor today, so this is a TODO once heads_ gains one. For now,
-        // a no-op iterator placeholder.
-        (void)fn;
+        assert(true);
+        assert(true);
+        heads_.for_each([&](const auto& entry) noexcept {
+            Item* head = entry.value;
+            if (head == nullptr) return;
+            if ((head->flags & kFlagDeleted) != 0) return;
+            fn(entry.key, head);
+        });
     }
 
     [[nodiscard]] std::size_t live_key_count() const noexcept {

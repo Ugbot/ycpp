@@ -115,6 +115,37 @@ public:
         return insert_unchecked(std::forward<KK>(k), std::forward<VV>(v));
     }
 
+    // Walk every live entry in slot order, calling `fn(entry)` for each.
+    // `fn` should accept `Entry&` or `const Entry&`. Skips empty +
+    // tombstoned slots via the control byte. Iteration order is
+    // hashmap-internal (the open-addressing layout); callers that need
+    // a stable order sort the keys themselves.
+    //
+    // Bounded by cap_; no allocation; ≥2 assertions per Tiger Style.
+    template <class Fn>
+    void for_each(Fn&& fn) noexcept {
+        assert(cap_ == 0 || ctrl_ != nullptr);
+        assert(cap_ == 0 || entries_ != nullptr);
+        for (std::size_t i = 0; i < cap_; ++i) {
+            const std::uint8_t c = ctrl_[i];
+            if (c == hashmap_detail::kCtrlEmpty) continue;
+            if (c == hashmap_detail::kCtrlTombstone) continue;
+            fn(entries_[i]);
+        }
+    }
+
+    template <class Fn>
+    void for_each(Fn&& fn) const noexcept {
+        assert(cap_ == 0 || ctrl_ != nullptr);
+        assert(cap_ == 0 || entries_ != nullptr);
+        for (std::size_t i = 0; i < cap_; ++i) {
+            const std::uint8_t c = ctrl_[i];
+            if (c == hashmap_detail::kCtrlEmpty) continue;
+            if (c == hashmap_detail::kCtrlTombstone) continue;
+            fn(entries_[i]);
+        }
+    }
+
     // Erase by key; returns true if the key was present.
     bool erase(const K& k) noexcept {
         Entry* e = find(k);
