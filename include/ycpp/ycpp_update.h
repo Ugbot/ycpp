@@ -106,6 +106,74 @@ namespace detail_decode {
 
 inline constexpr std::size_t kMaxClientsPerUpdate = 4096;
 inline constexpr std::size_t kMaxStructsPerClient = 1U << 24;
+inline constexpr int         kMaxAnyDepth         = 64;
+
+// Skip one lib0/any value, advancing the reader. lib0/any is Yjs's
+// JSON-like binary container for Y.Map values, Y.Array entries, and
+// Y.Embed payloads. Returns kOk on success, kCorruptInput / kOutOfBounds
+// on malformed input, kIntegrationFailed on excessive nesting depth.
+//
+// Type tags (from yjs/lib0/any):
+//    119 string         varString
+//    125 int32          varInt (zigzag)
+//    124 float32        4 bytes
+//    123 float64        8 bytes
+//    122 bigint64       8 bytes
+//    121 false          (no payload)
+//    120 true           (no payload)
+//    127 undefined      (no payload)
+//    126 null           (no payload)
+//    118 object         varUint count + count × (varString key, any value)
+//    117 array          varUint count + count × any value
+//    116 Uint8Array     varString-shaped (varUint byteLen + bytes)
+[[nodiscard]] inline Status skip_any(Reader& r, int depth) noexcept {
+    if (depth >= kMaxAnyDepth) return Status::kIntegrationFailed;
+    uint8_t type = 0;
+    YCPP_TRY(r.u8(&type));
+    switch (type) {
+        case 127: case 126: case 121: case 120:
+            return Status::kOk;
+        case 125: { int64_t  v = 0; return r.varint_i64(&v); }
+        case 124: return r.skip(4);
+        case 123: return r.skip(8);
+        case 122: return r.skip(8);
+        case 119: case 116: { ByteView v{}; return r.length_prefixed(&v); }
+        case 118: {
+            uint64_t n = 0;
+            YCPP_TRY(r.varint_u64(&n));
+            if (n > 65536) return Status::kCapacityExceeded;
+            for (uint64_t i = 0; i < n; ++i) {
+                ByteView key{};
+                YCPP_TRY(r.length_prefixed(&key));
+                YCPP_TRY(skip_any(r, depth + 1));
+            }
+            return Status::kOk;
+        }
+        case 117: {
+            uint64_t n = 0;
+            YCPP_TRY(r.varint_u64(&n));
+            if (n > 65536) return Status::kCapacityExceeded;
+            for (uint64_t i = 0; i < n; ++i) YCPP_TRY(skip_any(r, depth + 1));
+            return Status::kOk;
+        }
+        default:
+            return Status::kUnsupportedFormat;
+    }
+}
+
+// Skip a ContentAny payload (varUint count + count × lib0/any). Returns
+// the consumed byte slice via `*out`.
+[[nodiscard]] inline Status read_any_array(Reader& r, ByteView* out) noexcept {
+    assert(out != nullptr);
+    const std::size_t start = r.pos();
+    uint64_t n = 0;
+    YCPP_TRY(r.varint_u64(&n));
+    if (n > 65536) return Status::kCapacityExceeded;
+    for (uint64_t i = 0; i < n; ++i) YCPP_TRY(skip_any(r, 0));
+    const std::size_t consumed = r.pos() - start;
+    *out = ByteView{r.tail().data - consumed, consumed};
+    return Status::kOk;
+}
 
 [[nodiscard]] inline Status read_id(Reader& r, Id* out) noexcept {
     assert(out != nullptr);
@@ -135,14 +203,27 @@ inline constexpr std::size_t kMaxStructsPerClient = 1U << 24;
         case ContentKind::kJson:
         case ContentKind::kBinary:
         case ContentKind::kEmbed:
+            // All length-prefixed (varString / varUint8Array shape).
+            YCPP_TRY(r.length_prefixed(payload));
+            *length = 1;
+            return Status::kOk;
+
         case ContentKind::kAny:
+            // varUint count + count × lib0/any value. We capture the
+            // entire region as opaque bytes so the encoder can echo it
+            // back verbatim.
+            YCPP_TRY(read_any_array(r, payload));
+            *length = 1;
+            return Status::kOk;
+
         case ContentKind::kFormat:
         case ContentKind::kType:
         case ContentKind::kDoc:
         case ContentKind::kMove:
-            YCPP_TRY(r.length_prefixed(payload));
-            *length = 1;
-            return Status::kOk;
+            // Not yet implemented — see LIMITATIONS.md. Yjs docs using
+            // these (rich-text formats, nested types, sub-docs, moves)
+            // will surface kUnsupportedFormat here.
+            return Status::kUnsupportedFormat;
     }
     return Status::kUnsupportedFormat;
 }
@@ -171,14 +252,17 @@ inline constexpr std::size_t kMaxStructsPerClient = 1U << 24;
     if (info_has_left_origin (info)) YCPP_TRY(read_id(r, &out->origin_left));
     if (info_has_right_origin(info)) YCPP_TRY(read_id(r, &out->origin_right));
     if (info_has_parent_info (info)) {
-        uint8_t parent_tag = 0;
-        YCPP_TRY(r.u8(&parent_tag));
+        // Yjs convention: tag is a varUint. 1 = root type identified by
+        // name string; 0 = parent is the Item referenced by the trailing
+        // (client, clock) Id.
+        uint64_t parent_tag = 0;
+        YCPP_TRY(r.varint_u64(&parent_tag));
         if (parent_tag == 1) {
-            out->parent_ref = ParentRef::kId;
-            YCPP_TRY(read_id(r, &out->parent_id));
-        } else if (parent_tag == 0) {
             out->parent_ref = ParentRef::kRootName;
             YCPP_TRY(r.length_prefixed(&out->parent_name));
+        } else if (parent_tag == 0) {
+            out->parent_ref = ParentRef::kId;
+            YCPP_TRY(read_id(r, &out->parent_id));
         } else {
             return Status::kCorruptInput;
         }

@@ -1,0 +1,13 @@
+{
+  "name": "ycpp-yjs-interop",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Interop test: pipe Yjs JS updateV1 through ycpp_cli and verify round-trip.",
+  "type": "module",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "yjs": "^13.6.0"
+  }
+}

@@ -24,6 +24,7 @@ endif()
 
 option(YCPP_BUILD_TESTS         "Build ycpp tests"               ${YCPP_IS_TOPLEVEL})
 option(YCPP_BUILD_BENCHMARKS    "Build ycpp benchmarks"          OFF)
+option(YCPP_BUILD_INTEROP       "Build Yjs interop CLI"          ${YCPP_IS_TOPLEVEL})
 option(YCPP_WARNINGS_AS_ERRORS  "Treat compile warnings as errors" ${YCPP_IS_TOPLEVEL})
 
 # --- language standard -------------------------------------------------------
@@ -68,6 +69,10 @@ endif()
 
 if(YCPP_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
+endif()
+
+if(YCPP_BUILD_INTEROP)
+    add_subdirectory(tools/yjs_interop)
 endif()
 
 # --- summary line ------------------------------------------------------------

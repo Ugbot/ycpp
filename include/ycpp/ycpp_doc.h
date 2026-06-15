@@ -36,7 +36,9 @@
 #include "ycpp_struct_store.h"
 #include "ycpp_update.h"
 #include "ycpp_writer.h"
+#include "ycpp_yarray.h"
 #include "ycpp_ymap.h"
+#include "ycpp_ytext.h"
 
 namespace ycpp {
 
@@ -47,9 +49,11 @@ public:
         : alloc_(std::move(allocator)),
           item_pool_(&alloc_, 256),
           ymap_pool_(&alloc_, 8),
+          yarray_pool_(&alloc_, 8),
           store_(&alloc_),
           deletes_(&alloc_),
           roots_(&alloc_),
+          arrays_(&alloc_),
           client_id_(client_id),
           next_clock_(0) {}
 
@@ -81,6 +85,33 @@ public:
         std::size_t n = 0;
         while (name[n] != '\0') ++n;
         return get_or_create_map(ByteView{reinterpret_cast<const uint8_t*>(name), n});
+    }
+
+    // --- root Y.Array / Y.Text access ---------------------------------------
+    [[nodiscard]] YArray<A>* get_or_create_array(ByteView name) noexcept {
+        auto* hit = arrays_.find(name);
+        if (hit != nullptr) return hit->value;
+        ByteView owned = clone_view(name);
+        if (owned.data == nullptr && name.size != 0) return nullptr;
+        YArray<A>* arr = yarray_pool_.acquire(&alloc_);
+        if (arr == nullptr) return nullptr;
+        auto [entry, inserted] = arrays_.insert(owned, arr);
+        if (!inserted) { yarray_pool_.release(arr); return entry->value; }
+        return arr;
+    }
+
+    [[nodiscard]] YArray<A>* get_or_create_array(const char* name) noexcept {
+        return get_or_create_array(cstr_view(name));
+    }
+
+    // Y.Text is a value-typed facade around a YArray. Two calls with the
+    // same name return facades pointing at the same underlying YArray.
+    [[nodiscard]] YText<A> get_or_create_text(ByteView name) noexcept {
+        return YText<A>{get_or_create_array(name)};
+    }
+
+    [[nodiscard]] YText<A> get_or_create_text(const char* name) noexcept {
+        return YText<A>{get_or_create_array(name)};
     }
 
     // --- local edits ---------------------------------------------------------
@@ -120,6 +151,89 @@ public:
     [[nodiscard]] Status map_set_string(const char* root, const char* key,
                                         const char* value, Id* out_id = nullptr) noexcept {
         return map_set_string(cstr_view(root), cstr_view(key), cstr_view(value), out_id);
+    }
+
+    // Insert a UTF-8 chunk into a Y.Array / Y.Text at the given live index.
+    // - index == 0           → prepend (origin_left = kInvalidId, origin_right = first live)
+    // - index == length      → append  (origin_left = last live, origin_right = kInvalidId)
+    // - 0 < index < length   → between predecessor and successor
+    // - index > length       → kOutOfBounds
+    //
+    // The new Item's content_kind is `kString` and the bytes are copied
+    // into the doc's arena. Use `array_insert_after_id` if you already
+    // have the predecessor Id (cheaper — skips the linear walk).
+    [[nodiscard]] Status array_insert_at(ByteView root_name, uint64_t index,
+                                         ByteView value, Id* out_id = nullptr) noexcept {
+        YArray<A>* arr = get_or_create_array(root_name);
+        if (arr == nullptr) return Status::kOutOfMemory;
+
+        // Walk to find the predecessor + successor among LIVE items only.
+        Item* predecessor = nullptr;
+        Item* successor   = nullptr;
+        {
+            uint64_t live_seen = 0;
+            for (Item* o = arr->raw_start(); o != nullptr; o = o->right) {
+                if ((o->flags & kFlagDeleted) != 0) continue;
+                if (live_seen == index) { successor = o; break; }
+                predecessor = o;
+                ++live_seen;
+                if (live_seen > index) return Status::kOutOfBounds;
+            }
+            // index past the end is allowed only if it equals length.
+            if (successor == nullptr) {
+                uint64_t live_total = live_seen + (predecessor != nullptr ? 1 : 0);
+                if (index > live_total) return Status::kOutOfBounds;
+            }
+        }
+
+        const Id origin_left  = predecessor != nullptr ? predecessor->id : kInvalidId;
+        const Id origin_right = successor   != nullptr ? successor->id   : kInvalidId;
+
+        return emit_array_item(arr, root_name, origin_left, origin_right,
+                               value, out_id);
+    }
+
+    [[nodiscard]] Status array_insert_at(const char* root, uint64_t index,
+                                         const char* value, Id* out_id = nullptr) noexcept {
+        return array_insert_at(cstr_view(root), index, cstr_view(value), out_id);
+    }
+
+    // Convenience: append `value` to a Y.Text root.
+    [[nodiscard]] Status text_append(ByteView root_name, ByteView value,
+                                     Id* out_id = nullptr) noexcept {
+        YArray<A>* arr = get_or_create_array(root_name);
+        if (arr == nullptr) return Status::kOutOfMemory;
+
+        // Find the last LIVE item once; emit the new Item with origin_left
+        // set to its Id. O(N) today; W6 caches tail pointer if needed.
+        Item* tail = nullptr;
+        for (Item* o = arr->raw_start(); o != nullptr; o = o->right) {
+            if ((o->flags & kFlagDeleted) == 0) tail = o;
+        }
+        const Id origin_left = tail != nullptr ? tail->id : kInvalidId;
+        return emit_array_item(arr, root_name, origin_left, kInvalidId,
+                               value, out_id);
+    }
+
+    [[nodiscard]] Status text_append(const char* root, const char* value,
+                                     Id* out_id = nullptr) noexcept {
+        return text_append(cstr_view(root), cstr_view(value), out_id);
+    }
+
+    // Delete the live item at index `i` from a Y.Array / Y.Text root.
+    // Adds the item to the delete set so peers converge.
+    [[nodiscard]] Status array_delete_at(ByteView root_name, uint64_t index) noexcept {
+        YArray<A>* arr = get_or_create_array(root_name);
+        if (arr == nullptr) return Status::kOutOfMemory;
+        Item* target = arr->at(index);
+        if (target == nullptr) return Status::kOutOfBounds;
+        arr->mark_deleted(target);
+        return deletes_.add(target->id.client, target->id.clock,
+                            target->length == 0 ? 1 : target->length);
+    }
+
+    [[nodiscard]] Status array_delete_at(const char* root, uint64_t index) noexcept {
+        return array_delete_at(cstr_view(root), index);
     }
 
     // --- wire I/O ------------------------------------------------------------
@@ -186,19 +300,63 @@ private:
             return Status::kOutOfMemory;
         }
 
-        const bool is_map_value =
-            (d.parent_ref   == ParentRef::kRootName) &&
-            (d.parent_sub.size > 0) &&
+        // Yjs convention: when either origin is set, the parent reference is
+        // not on the wire — it's inherited from the predecessor item.
+        // ycpp emits this way too (build_info_byte), so on decode we need to
+        // chase the chain back to a root-bearing ancestor.
+        if (it->parent_ref == ParentRef::kNone) {
+            inherit_parent_from_origin(it);
+        }
+
+        const bool is_value_kind =
             (d.content_kind == ContentKind::kString  ||
              d.content_kind == ContentKind::kJson    ||
-             d.content_kind == ContentKind::kBinary);
+             d.content_kind == ContentKind::kBinary  ||
+             d.content_kind == ContentKind::kAny);
+
+        const bool is_map_value =
+            (it->parent_ref      == ParentRef::kRootName) &&
+            (it->parent_sub.size > 0) && is_value_kind;
+
+        const bool is_array_item =
+            (it->parent_ref      == ParentRef::kRootName) &&
+            (it->parent_sub.size == 0) && is_value_kind;
 
         if (is_map_value) {
             YMap<A>* m = get_or_create_map(it->parent_name);
             if (m == nullptr) { item_pool_.release(it); return Status::kOutOfMemory; }
             return install_into_map(it, m);
         }
+        if (is_array_item) {
+            YArray<A>* arr = get_or_create_array(it->parent_name);
+            if (arr == nullptr) { item_pool_.release(it); return Status::kOutOfMemory; }
+            return install_into_array(it, arr);
+        }
         return install_bare(it);
+    }
+
+    // Walk origin_left (preferred) / origin_right chains until we find an
+    // item whose parent_ref is set, then copy its parent fields into `it`.
+    // Bounded by kMaxParentHops so a corrupt cycle can't spin forever.
+    void inherit_parent_from_origin(Item* it) noexcept {
+        constexpr int kMaxParentHops = 1024;
+        Id cursor = is_valid(it->origin_left)  ? it->origin_left
+                  : is_valid(it->origin_right) ? it->origin_right
+                                               : kInvalidId;
+        for (int i = 0; i < kMaxParentHops && is_valid(cursor); ++i) {
+            Item* pred = const_cast<Item*>(store_.find_by_id(cursor));
+            if (pred == nullptr) return;
+            if (pred->parent_ref != ParentRef::kNone) {
+                it->parent_ref  = pred->parent_ref;
+                it->parent_id   = pred->parent_id;
+                it->parent_name = pred->parent_name;  // arena-owned; shared aliasing is safe
+                // parent_sub is per-item (LWW Y.Map key); don't inherit.
+                return;
+            }
+            cursor = is_valid(pred->origin_left)  ? pred->origin_left
+                   : is_valid(pred->origin_right) ? pred->origin_right
+                                                  : kInvalidId;
+        }
     }
 
     [[nodiscard]] Status install_bare(Item* it) noexcept {
@@ -218,6 +376,47 @@ private:
                                   loser->length == 0 ? 1 : loser->length));
         }
         bump_clock_for(it);
+        return Status::kOk;
+    }
+
+    [[nodiscard]] Status install_into_array(Item* it, YArray<A>* arr) noexcept {
+        const Status s = store_.append(it);
+        if (s != Status::kOk) { item_pool_.release(it); return s; }
+        YCPP_TRY(arr->integrate(it, store_));
+        bump_clock_for(it);
+        return Status::kOk;
+    }
+
+    // Local Y.Array emit: build an Item with the supplied origins, persist
+    // through install_into_array, surface the new Id.
+    [[nodiscard]] Status emit_array_item(YArray<A>* arr, ByteView root_name,
+                                          Id origin_left, Id origin_right,
+                                          ByteView value, Id* out_id) noexcept {
+        Item* it = item_pool_.acquire();
+        if (it == nullptr) return Status::kOutOfMemory;
+        ByteView owned_name  = clone_view(root_name);
+        ByteView owned_value = clone_view(value);
+        if ((root_name.size != 0 && owned_name.data  == nullptr) ||
+            (value.size     != 0 && owned_value.data == nullptr)) {
+            item_pool_.release(it);
+            return Status::kOutOfMemory;
+        }
+        it->id            = Id{client_id_, next_clock_};
+        it->origin_left   = origin_left;
+        it->origin_right  = origin_right;
+        it->parent_ref    = ParentRef::kRootName;
+        it->parent_name   = owned_name;
+        it->parent_sub    = ByteView{};
+        it->parent_id     = kInvalidId;
+        it->content_kind  = ContentKind::kString;
+        it->length        = 1;
+        it->content_view  = owned_value;
+        it->flags         = 0;
+        it->left          = nullptr;
+        it->right         = nullptr;
+
+        YCPP_TRY(install_into_array(it, arr));
+        if (out_id != nullptr) *out_id = it->id;
         return Status::kOk;
     }
 
@@ -254,11 +453,15 @@ private:
     A                                   alloc_;
     Pool<Item, A>                       item_pool_;
     Pool<YMap<A>, A>                    ymap_pool_;
+    Pool<YArray<A>, A>                  yarray_pool_;
     StructStore<A>                      store_;
     DeleteSet<A>                        deletes_;
     HashMap<ByteView, YMap<A>*, A,
             ymap_detail::ByteViewHash,
             ymap_detail::ByteViewEq>    roots_;
+    HashMap<ByteView, YArray<A>*, A,
+            ymap_detail::ByteViewHash,
+            ymap_detail::ByteViewEq>    arrays_;
     uint64_t                            client_id_;
     uint64_t                            next_clock_;
 };
@@ -291,12 +494,17 @@ namespace detail_encode {
         case ContentKind::kJson:
         case ContentKind::kBinary:
         case ContentKind::kEmbed:
+            return w.length_prefixed(it->content_view.data, it->content_view.size);
+
         case ContentKind::kAny:
+            // Captured verbatim by the decoder; write back as raw bytes.
+            return w.bytes(it->content_view.data, it->content_view.size);
+
         case ContentKind::kFormat:
         case ContentKind::kType:
         case ContentKind::kDoc:
         case ContentKind::kMove:
-            return w.length_prefixed(it->content_view.data, it->content_view.size);
+            return Status::kUnsupportedFormat;
     }
     return Status::kUnsupportedFormat;
 }
@@ -308,12 +516,13 @@ namespace detail_encode {
     if (info_has_left_origin (info)) YCPP_TRY(write_id(w, it->origin_left));
     if (info_has_right_origin(info)) YCPP_TRY(write_id(w, it->origin_right));
     if (info_has_parent_info (info)) {
-        if (it->parent_ref == ParentRef::kId) {
-            YCPP_TRY(w.u8(1));
-            YCPP_TRY(write_id(w, it->parent_id));
-        } else if (it->parent_ref == ParentRef::kRootName) {
-            YCPP_TRY(w.u8(0));
+        // Yjs convention (varUint): 1 = root type by name; 0 = parent Id.
+        if (it->parent_ref == ParentRef::kRootName) {
+            YCPP_TRY(w.varint_u64(1));
             YCPP_TRY(w.length_prefixed(it->parent_name.data, it->parent_name.size));
+        } else if (it->parent_ref == ParentRef::kId) {
+            YCPP_TRY(w.varint_u64(0));
+            YCPP_TRY(write_id(w, it->parent_id));
         } else {
             return Status::kInternal;
         }
