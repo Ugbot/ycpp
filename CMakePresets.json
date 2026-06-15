@@ -1,0 +1,58 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release (single-config Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "YCPP_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (single-config Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "YCPP_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "msvc",
+      "displayName": "MSVC multi-config (Visual Studio 17 2022)",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/msvc",
+      "cacheVariables": {
+        "YCPP_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "ninja-clang",
+      "displayName": "Ninja + clang (Release)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "YCPP_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release",     "configurePreset": "release"     },
+    { "name": "debug",       "configurePreset": "debug"       },
+    { "name": "msvc",        "configurePreset": "msvc",        "configuration": "Release" },
+    { "name": "ninja-clang", "configurePreset": "ninja-clang" }
+  ],
+  "testPresets": [
+    { "name": "release",     "configurePreset": "release",     "output": { "outputOnFailure": true } },
+    { "name": "debug",       "configurePreset": "debug",       "output": { "outputOnFailure": true } },
+    { "name": "msvc",        "configurePreset": "msvc",        "configuration": "Release", "output": { "outputOnFailure": true } },
+    { "name": "ninja-clang", "configurePreset": "ninja-clang", "output": { "outputOnFailure": true } }
+  ]
+}

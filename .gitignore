@@ -1,0 +1,16 @@
+# build directories
+build/
+out/
+cmake-build-*/
+
+# editor caches
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# tooling
+compile_commands.json
+.cache/
