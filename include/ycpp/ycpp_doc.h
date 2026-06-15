@@ -34,6 +34,7 @@
 #include "ycpp_state_vector.h"
 #include "ycpp_status.h"
 #include "ycpp_struct_store.h"
+#include "ycpp_unicode.h"
 #include "ycpp_update.h"
 #include "ycpp_writer.h"
 #include "ycpp_yarray.h"
@@ -139,7 +140,13 @@ public:
         it->parent_name   = owned_name;
         it->parent_sub    = owned_key;
         it->content_kind  = ContentKind::kString;
-        it->length        = 1;
+        // Length MUST match what the wire-decoder will recompute from
+        // the content bytes (UTF-16 code units) — else state vector
+        // arithmetic diverges across peers.
+        {
+            const uint64_t n = utf16_length_of_utf8(owned_value);
+            it->length = (n == 0) ? 1 : n;
+        }
         it->content_view  = owned_value;
         it->flags         = 0;
 
@@ -186,8 +193,13 @@ public:
             }
         }
 
-        const Id origin_left  = predecessor != nullptr ? predecessor->id : kInvalidId;
-        const Id origin_right = successor   != nullptr ? successor->id   : kInvalidId;
+        Id origin_left = kInvalidId;
+        if (predecessor != nullptr) {
+            const uint64_t len = predecessor->length == 0 ? 1 : predecessor->length;
+            origin_left = Id{predecessor->id.client,
+                              predecessor->id.clock + len - 1};
+        }
+        const Id origin_right = successor != nullptr ? successor->id : kInvalidId;
 
         return emit_array_item(arr, root_name, origin_left, origin_right,
                                value, out_id);
@@ -204,13 +216,17 @@ public:
         YArray<A>* arr = get_or_create_array(root_name);
         if (arr == nullptr) return Status::kOutOfMemory;
 
-        // Find the last LIVE item once; emit the new Item with origin_left
-        // set to its Id. O(N) today; W6 caches tail pointer if needed.
+        // Find the last LIVE item; origin_left = its LAST clock so the
+        // integration anchor is the END of the tail's run, not the start.
         Item* tail = nullptr;
         for (Item* o = arr->raw_start(); o != nullptr; o = o->right) {
             if ((o->flags & kFlagDeleted) == 0) tail = o;
         }
-        const Id origin_left = tail != nullptr ? tail->id : kInvalidId;
+        Id origin_left = kInvalidId;
+        if (tail != nullptr) {
+            const uint64_t len = tail->length == 0 ? 1 : tail->length;
+            origin_left = Id{tail->id.client, tail->id.clock + len - 1};
+        }
         return emit_array_item(arr, root_name, origin_left, kInvalidId,
                                value, out_id);
     }
@@ -253,14 +269,47 @@ public:
         DecodedUpdate<A> decoded{&alloc_};
         YCPP_TRY(decode_update_v1<A>(bytes, &decoded));
 
-        for (std::size_t i = 0; i < decoded.size(); ++i) {
-            YCPP_TRY(apply_one(decoded.at(i)));
+        // Multi-pass: items whose origin Ids haven't yet landed in the
+        // store come back as kPendingReference; we retry until either
+        // every struct integrates or a pass makes no progress. Bounded
+        // by the struct count — each pass either advances or aborts.
+        const std::size_t n = decoded.size();
+        if (n > 0) {
+            bool stack_done[256];
+            bool* done = nullptr;
+            if (n <= sizeof(stack_done) / sizeof(stack_done[0])) {
+                done = stack_done;
+            } else {
+                done = static_cast<bool*>(alloc_.alloc(sizeof(bool) * n, alignof(bool)));
+                if (done == nullptr) return Status::kOutOfMemory;
+            }
+            for (std::size_t i = 0; i < n; ++i) done[i] = false;
+
+            std::size_t remaining = n;
+            for (std::size_t pass = 0; pass < n + 1 && remaining > 0; ++pass) {
+                bool progress = false;
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (done[i]) continue;
+                    const Status s = apply_one(decoded.at(i));
+                    if (s == Status::kOk) {
+                        done[i] = true;
+                        --remaining;
+                        progress = true;
+                    } else if (s == Status::kPendingReference) {
+                        // Try again next pass.
+                    } else {
+                        return s;
+                    }
+                }
+                if (!progress) break;
+            }
+            if (remaining > 0) return Status::kPendingReference;
         }
 
         Status acc = Status::kOk;
         decoded.delete_set().for_each_client(
-            [&](uint64_t client, const DeleteRange* rs, std::size_t n) noexcept {
-                for (std::size_t i = 0; i < n; ++i) {
+            [&](uint64_t client, const DeleteRange* rs, std::size_t cnt) noexcept {
+                for (std::size_t i = 0; i < cnt; ++i) {
                     if (acc != Status::kOk) return;
                     const Status s = deletes_.add(client, rs[i].clock_start, rs[i].length);
                     if (s != Status::kOk) { acc = s; return; }
@@ -279,6 +328,19 @@ public:
 private:
     [[nodiscard]] Status apply_one(const DecodedStruct& d) noexcept {
         if (store_.find_by_id(d.id) != nullptr) return Status::kOk;
+
+        // If the wire didn't carry parent_info (because the encoder
+        // omitted it once an origin was set), we need the predecessor
+        // already in the store to chase its parent. If the predecessor
+        // hasn't landed yet, defer to the next apply pass.
+        if (d.parent_ref == ParentRef::kNone) {
+            if (is_valid(d.origin_left)  && store_.find_by_id(d.origin_left ) == nullptr) {
+                return Status::kPendingReference;
+            }
+            if (is_valid(d.origin_right) && store_.find_by_id(d.origin_right) == nullptr) {
+                return Status::kPendingReference;
+            }
+        }
 
         Item* it = item_pool_.acquire();
         if (it == nullptr) return Status::kOutOfMemory;
@@ -409,7 +471,11 @@ private:
         it->parent_sub    = ByteView{};
         it->parent_id     = kInvalidId;
         it->content_kind  = ContentKind::kString;
-        it->length        = 1;
+        // Length = UTF-16 code units of value, matching Y.Text semantics.
+        {
+            const uint64_t n = utf16_length_of_utf8(owned_value);
+            it->length = (n == 0) ? 1 : n;
+        }
         it->content_view  = owned_value;
         it->flags         = 0;
         it->left          = nullptr;
@@ -491,20 +557,20 @@ namespace detail_encode {
         case ContentKind::kDeleted:
             return w.varint_u64(it->length == 0 ? 1 : it->length);
         case ContentKind::kString:
-        case ContentKind::kJson:
         case ContentKind::kBinary:
         case ContentKind::kEmbed:
+            // Length-prefixed wire (varString / varUint8Array).
             return w.length_prefixed(it->content_view.data, it->content_view.size);
 
         case ContentKind::kAny:
-            // Captured verbatim by the decoder; write back as raw bytes.
-            return w.bytes(it->content_view.data, it->content_view.size);
-
+        case ContentKind::kJson:
         case ContentKind::kFormat:
         case ContentKind::kType:
         case ContentKind::kDoc:
         case ContentKind::kMove:
-            return Status::kUnsupportedFormat;
+            // Decoder captured the full structural payload (varUint count
+            // + items / key+value / type-ref / etc.) verbatim. Echo back.
+            return w.bytes(it->content_view.data, it->content_view.size);
     }
     return Status::kUnsupportedFormat;
 }

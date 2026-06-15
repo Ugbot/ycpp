@@ -20,6 +20,7 @@
 #include "ycpp_item.h"
 #include "ycpp_reader.h"
 #include "ycpp_status.h"
+#include "ycpp_unicode.h"
 
 namespace ycpp {
 
@@ -162,14 +163,91 @@ inline constexpr int         kMaxAnyDepth         = 64;
 }
 
 // Skip a ContentAny payload (varUint count + count × lib0/any). Returns
-// the consumed byte slice via `*out`.
-[[nodiscard]] inline Status read_any_array(Reader& r, ByteView* out) noexcept {
-    assert(out != nullptr);
+// the consumed byte slice via `*out` and the element count via `*out_count`.
+[[nodiscard]] inline Status read_any_array(Reader& r, ByteView* out,
+                                            uint64_t* out_count) noexcept {
+    assert(out       != nullptr);
+    assert(out_count != nullptr);
     const std::size_t start = r.pos();
     uint64_t n = 0;
     YCPP_TRY(r.varint_u64(&n));
     if (n > 65536) return Status::kCapacityExceeded;
     for (uint64_t i = 0; i < n; ++i) YCPP_TRY(skip_any(r, 0));
+    const std::size_t consumed = r.pos() - start;
+    *out       = ByteView{r.tail().data - consumed, consumed};
+    *out_count = n;
+    return Status::kOk;
+}
+
+// Skip a ContentJSON payload (varUint count + count × varString). Returns
+// the byte slice + element count.
+[[nodiscard]] inline Status read_json_array(Reader& r, ByteView* out,
+                                             uint64_t* out_count) noexcept {
+    assert(out       != nullptr);
+    assert(out_count != nullptr);
+    const std::size_t start = r.pos();
+    uint64_t n = 0;
+    YCPP_TRY(r.varint_u64(&n));
+    if (n > 65536) return Status::kCapacityExceeded;
+    for (uint64_t i = 0; i < n; ++i) {
+        ByteView s{};
+        YCPP_TRY(r.length_prefixed(&s));
+    }
+    const std::size_t consumed = r.pos() - start;
+    *out       = ByteView{r.tail().data - consumed, consumed};
+    *out_count = n;
+    return Status::kOk;
+}
+
+// ContentFormat = varString key + varString value-as-JSON. Captures the
+// full payload as opaque bytes.
+[[nodiscard]] inline Status read_format(Reader& r, ByteView* out) noexcept {
+    assert(out != nullptr);
+    const std::size_t start = r.pos();
+    ByteView key{}, val{};
+    YCPP_TRY(r.length_prefixed(&key));
+    YCPP_TRY(r.length_prefixed(&val));
+    const std::size_t consumed = r.pos() - start;
+    *out = ByteView{r.tail().data - consumed, consumed};
+    return Status::kOk;
+}
+
+// ContentType = varUint type-ref. We capture the bytes verbatim so the
+// encoder can echo them.
+[[nodiscard]] inline Status read_type_ref(Reader& r, ByteView* out) noexcept {
+    assert(out != nullptr);
+    const std::size_t start = r.pos();
+    uint64_t ref = 0;
+    YCPP_TRY(r.varint_u64(&ref));
+    const std::size_t consumed = r.pos() - start;
+    *out = ByteView{r.tail().data - consumed, consumed};
+    return Status::kOk;
+}
+
+// ContentDoc = varString guid + lib0/any opts.
+[[nodiscard]] inline Status read_doc(Reader& r, ByteView* out) noexcept {
+    assert(out != nullptr);
+    const std::size_t start = r.pos();
+    ByteView guid{};
+    YCPP_TRY(r.length_prefixed(&guid));
+    YCPP_TRY(skip_any(r, 0));
+    const std::size_t consumed = r.pos() - start;
+    *out = ByteView{r.tail().data - consumed, consumed};
+    return Status::kOk;
+}
+
+// ContentMove = startID + endID + uint8 priority. Both IDs are
+// (varUint client, varUint clock).
+[[nodiscard]] inline Status read_move(Reader& r, ByteView* out) noexcept {
+    assert(out != nullptr);
+    const std::size_t start = r.pos();
+    uint64_t a = 0, b = 0, c = 0, d = 0;
+    YCPP_TRY(r.varint_u64(&a));  // startID.client
+    YCPP_TRY(r.varint_u64(&b));  // startID.clock
+    YCPP_TRY(r.varint_u64(&c));  // endID.client
+    YCPP_TRY(r.varint_u64(&d));  // endID.clock
+    uint8_t prio = 0;
+    YCPP_TRY(r.u8(&prio));
     const std::size_t consumed = r.pos() - start;
     *out = ByteView{r.tail().data - consumed, consumed};
     return Status::kOk;
@@ -200,30 +278,52 @@ inline constexpr int         kMaxAnyDepth         = 64;
             return Status::kOk;
 
         case ContentKind::kString:
-        case ContentKind::kJson:
+            // varString: varUint byteLen + UTF-8 bytes. The CRDT length
+            // is the UTF-16 code unit count of the decoded string (Yjs
+            // semantics) — derive from the bytes.
+            YCPP_TRY(r.length_prefixed(payload));
+            *length = utf16_length_of_utf8(*payload);
+            if (*length == 0) *length = 1;  // empty-string Item still occupies 1 slot
+            return Status::kOk;
+
         case ContentKind::kBinary:
         case ContentKind::kEmbed:
-            // All length-prefixed (varString / varUint8Array shape).
+            // Single varString-shaped value. CRDT length = 1.
             YCPP_TRY(r.length_prefixed(payload));
             *length = 1;
             return Status::kOk;
 
+        case ContentKind::kJson:
+            // varUint count + count × varString. CRDT length = count.
+            YCPP_TRY(read_json_array(r, payload, length));
+            if (*length == 0) *length = 1;
+            return Status::kOk;
+
         case ContentKind::kAny:
-            // varUint count + count × lib0/any value. We capture the
-            // entire region as opaque bytes so the encoder can echo it
-            // back verbatim.
-            YCPP_TRY(read_any_array(r, payload));
-            *length = 1;
+            // varUint count + count × lib0/any value. CRDT length = count.
+            YCPP_TRY(read_any_array(r, payload, length));
+            if (*length == 0) *length = 1;
             return Status::kOk;
 
         case ContentKind::kFormat:
+            YCPP_TRY(read_format(r, payload));
+            *length = 1;
+            return Status::kOk;
+
         case ContentKind::kType:
+            YCPP_TRY(read_type_ref(r, payload));
+            *length = 1;
+            return Status::kOk;
+
         case ContentKind::kDoc:
+            YCPP_TRY(read_doc(r, payload));
+            *length = 1;
+            return Status::kOk;
+
         case ContentKind::kMove:
-            // Not yet implemented — see LIMITATIONS.md. Yjs docs using
-            // these (rich-text formats, nested types, sub-docs, moves)
-            // will surface kUnsupportedFormat here.
-            return Status::kUnsupportedFormat;
+            YCPP_TRY(read_move(r, payload));
+            *length = 1;
+            return Status::kOk;
     }
     return Status::kUnsupportedFormat;
 }

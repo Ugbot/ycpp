@@ -72,7 +72,7 @@ TEST(YcppDecodeV1, SingleStringInsertWithRootParent) {
     b.emit_u8(static_cast<uint8_t>(ContentKind::kString));
     // Parent info present (no origin bits set, kind ≠ GC/Skip):
     //   tag 0 → root-name parent.
-    b.emit_u8(0);
+    b.emit_u8(1);  // tag=1 → root by name (Yjs convention)
     const char* root = "rootmap";
     b.emit_length_prefixed(ByteView{reinterpret_cast<const uint8_t*>(root),
                                     std::strlen(root)});
@@ -109,7 +109,7 @@ TEST(YcppDecodeV1, TwoStructsWithOriginsAndParentSub) {
     {
         b.emit_u8(static_cast<uint8_t>(ContentKind::kString)
                   | kInfoFlagHasParentSub);
-        b.emit_u8(0);
+        b.emit_u8(1);  // tag=1 → root by name (Yjs convention)
         const char* root = "doc";
         b.emit_length_prefixed(ByteView{reinterpret_cast<const uint8_t*>(root),
                                         std::strlen(root)});
@@ -140,8 +140,10 @@ TEST(YcppDecodeV1, TwoStructsWithOriginsAndParentSub) {
     ASSERT_EQ(decode_update_v1(ByteView{b.buf.data(), b.buf.size()}, &out),
               Status::kOk);
     ASSERT_EQ(out.size(), 2U);
+    // Each kString item has length = UTF-16 code units of its content.
+    // "v0" is 2 chars → first item is at clock 0..1, second at clock 2.
     EXPECT_EQ(out.at(0).id, (Id{11, 0}));
-    EXPECT_EQ(out.at(1).id, (Id{11, 1}));
+    EXPECT_EQ(out.at(1).id, (Id{11, 2}));
     EXPECT_EQ(out.at(1).origin_left, (Id{11, 0}));
     EXPECT_EQ(out.at(1).parent_ref,   ParentRef::kNone);
     ASSERT_EQ(out.at(1).parent_sub.size, 1U);

@@ -115,6 +115,77 @@ function check(name, cond, detail = '') {
           `got=${JSON.stringify(got)}`);
 }
 
+// ----- Test 3a: Y.Text length-N items (multi-char insert + append) ----------
+{
+    console.log('\n[3a] Y.Text length-N items (multi-char insert + sequential append)');
+    const ydoc = new Y.Doc();
+    ydoc.clientID = 0x77;
+    const ytext = ydoc.getText('body');
+    ytext.insert(0, 'Hello, ');     // length=7 in UTF-16
+    ytext.insert(7, 'world!');      // length=6, anchored after 'Hello, '
+    const updateV1 = Y.encodeStateAsUpdate(ydoc);
+
+    // The second insert's origin_left should be (0x77, 6) — END of the
+    // first length-7 item. ycpp must compute length=7 from "Hello, " to
+    // accept the second item's origin without kPendingReference.
+    const r = runCli(['dump-text', 'body'], updateV1);
+    check('dump-text exits 0 on multi-append',
+          r.code === 0,
+          `exit=${r.code} stderr=${r.stderr.trim()}`);
+    if (r.code === 0) {
+        const got = r.stdout.toString('utf8');
+        check('dump-text matches "Hello, world!"',
+              got === 'Hello, world!',
+              `got=${JSON.stringify(got)}`);
+    }
+
+    // Verify round-trip is byte-correct via apply-and-emit.
+    const re = runCli(['apply-and-emit'], updateV1);
+    check('apply-and-emit length-N exits 0',
+          re.code === 0,
+          `exit=${re.code} stderr=${re.stderr.trim()}`);
+    if (re.code === 0) {
+        const fresh = new Y.Doc();
+        try {
+            Y.applyUpdate(fresh, re.stdout);
+            check('Yjs JS sees the same text after ycpp round-trip',
+                  fresh.getText('body').toString() === 'Hello, world!',
+                  `got=${JSON.stringify(fresh.getText('body').toString())}`);
+        } catch (e) {
+            check('apply ycpp output to fresh Y.Doc', false, e.message);
+        }
+    }
+}
+
+// ----- Test 3b: Y.Text concurrent mid-string edits (split needed) -----------
+{
+    console.log('\n[3b] Y.Text concurrent mid-string edit (interior origin → split)');
+    const alice = new Y.Doc(); alice.clientID = 1;
+    const bob   = new Y.Doc(); bob  .clientID = 2;
+
+    alice.getText('body').insert(0, 'Hello world');   // alice owns it as length=11
+    const a_to_b = Y.encodeStateAsUpdate(alice);
+    Y.applyUpdate(bob, a_to_b);
+
+    // Bob inserts ", reader" between 'Hello' and ' world' — at index 5.
+    bob.getText('body').insert(5, ', reader');
+    const expected = bob.getText('body').toString();  // Yjs canonical answer
+
+    // What ycpp sees: alice's "Hello world" (length=11) + bob's ", reader"
+    // with origin_left = (1, 4) which is INTERIOR to alice's item.
+    const merged = Y.encodeStateAsUpdate(bob);
+    const r = runCli(['dump-text', 'body'], merged);
+    check('dump-text on mid-string edit exits 0',
+          r.code === 0,
+          `exit=${r.code} stderr=${r.stderr.trim()}`);
+    if (r.code === 0) {
+        const got = r.stdout.toString('utf8');
+        check(`dump-text matches Yjs canonical "${expected}"`,
+              got === expected,
+              `got=${JSON.stringify(got)} expected=${JSON.stringify(expected)}`);
+    }
+}
+
 // ----- Test 3: Y.Text concurrent edits converge ------------------------------
 {
     console.log('\n[3] Y.Text concurrent appends (Yjs JS → ycpp)');

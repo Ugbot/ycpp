@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.0.3 — length-N items + rich-content skippers + Yjs JS interior-edit interop
+
+CRDT wire-format completeness:
+- **Length-N items**: `kString` content now reports `length` as the
+  UTF-16 code unit count of its UTF-8 bytes (Yjs's CRDT length
+  semantics). `kAny` and `kJson` report the varUint element count.
+  State-vector arithmetic is consistent across peers.
+- **Local edits** (`map_set_string`, `text_append`, `array_insert_at`)
+  set `length` to match what the receiver's wire decoder will recompute.
+  `text_append` anchors `origin_left` at the END of the tail item's
+  run (was the START), so subsequent appends from peers land in the
+  correct position.
+- **Decoder skippers** for `kFormat` (varString key + varString value),
+  `kType` (varUint type-ref), `kDoc` (varString guid + lib0/any opts),
+  `kMove` (start ID + end ID + priority byte). Each captures the
+  structural payload verbatim; the encoder echoes it byte-for-byte.
+  Yjs docs using rich text format ranges or nested types round-trip
+  through ycpp without loss.
+- **Multi-pass apply**: structs whose origin Ids haven't yet landed in
+  the store (because the wire emitted them after the dependent struct)
+  defer to the next pass and retry until fixedpoint. Resolves Yjs's
+  encoder ordering where mid-string concurrent edits put the newer
+  client's struct first.
+- **UTF-16 helpers** (`utf16_length_of_utf8`,
+  `utf8_byte_offset_for_utf16_units`) for callers that need to
+  translate clock offsets to byte offsets and back.
+
+Yjs JS interop (`tools/yjs_interop/test.js`):
+- 13/13 assertions green against real `yjs` npm package via Node 22.
+- New scenarios proven:
+  - Y.Text multi-char insert + sequential append ("Hello, world!")
+  - Y.Text concurrent mid-string edit (Bob inserts ", reader" at
+    index 5 of Alice's "Hello world" → both peers converge to
+    "Hello, reader world")
+
+Docs:
+- LIMITATIONS.md rewritten to reflect what 0.0.3 actually does + what
+  is still deferred (rich-text rendering / sub-doc materialization /
+  Y.Move re-anchoring / UndoManager / GC / updateV2).
+
 ## 0.0.2 — collaborative text + RPC primitives
 
 CRDT core:

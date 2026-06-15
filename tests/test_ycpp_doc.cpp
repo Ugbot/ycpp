@@ -43,7 +43,8 @@ TEST(YcppDoc, LocalSetThenGetReturnsValue) {
     auto* it = m->get(sv("title"));
     ASSERT_NE(it, nullptr);
     EXPECT_EQ(as_sv(it->content_view), std::string_view{"Hello"});
-    EXPECT_EQ(doc.next_clock(), 1U);
+    // next_clock is the UTF-16 length of the inserted value.
+    EXPECT_EQ(doc.next_clock(), 5U);
 }
 
 TEST(YcppDoc, OverwriteSameKeyMarksPriorDeleted) {
@@ -147,5 +148,7 @@ TEST(YcppDoc, StateVectorReflectsAppliedStructs) {
     DefaultArenaAllocator a;
     SvA out_sv{&a};
     ASSERT_EQ(doc.state_vector(&out_sv), Status::kOk);
-    EXPECT_EQ(out_sv.get(42), 3U);
+    // Each map_set_string advances the clock by UTF-16 length of value.
+    // "v1" "v2" "v3" are each 2 chars → 6 total.
+    EXPECT_EQ(out_sv.get(42), 6U);
 }
