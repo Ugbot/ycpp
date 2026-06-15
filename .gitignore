@@ -14,3 +14,7 @@ cmake-build-*/
 # tooling
 compile_commands.json
 .cache/
+
+# Node interop deps
+tools/yjs_interop/node_modules/
+tools/yjs_interop/package-lock.json
