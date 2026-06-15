@@ -37,3 +37,7 @@ ycpp_add_test(test_ycpp_yarray_text)
 ycpp_add_test(test_ycpp_envelope)
 ycpp_add_test(test_ycpp_protocol)
 ycpp_add_test(test_ycpp_awareness)
+
+# 0.0.4 — UndoManager + GC/compact
+ycpp_add_test(test_ycpp_undo)
+ycpp_add_test(test_ycpp_compact)

@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.0.4 — UndoManager, GC, Y.Text delta, sub-docs, Y.Move, updateV2 surface
+
+New surfaces:
+- **`UndoManager<A>`** — origin-scoped undo/redo. `track(origin)` +
+  `capture_begin(origin)` / `capture_end()` frame local edits; `undo()`
+  marks the frame's items deleted + propagates to the Doc's delete set;
+  `redo()` clears the flag. Bounded depth (256 frames × 256 origins).
+- **`Doc::compact()`** — converts `kFlagDeleted` items to `kSkip`
+  placeholders. Frees `content_view` bytes; clock arithmetic preserved.
+  Skips items still referenced by another item's origin chain.
+- **`YText::delta(on_entry)`** — Yjs-style sequence: `Insert` entries
+  carry the text chunk plus the list of currently-active format
+  payloads; `Format` entries report each format Item (live or deleted).
+  Pure read; no allocations beyond the caller's collector.
+- **`SubDocRegistry<A>`** — parses `kDoc` content (`varString guid` +
+  `lib0/any opts`) and registers per Doc. `Doc::sub_docs()` enumerates
+  by guid; `find(guid)` returns the `SubDocRef { id, guid, opts }`.
+- **`ycpp::decode_move(payload, *out)` / `apply_move(item, op, store)`**
+  — Y.Move op decoder + range-relocation. `Doc::install_into_array`
+  triggers `apply_move` automatically when integrating a `kMove` Item.
+- **`apply_update_v2` / `encode_diff_v2`** — public surface (returns
+  `kUnsupportedFormat` in 0.0.4; full v2 RLE-stream implementation
+  lands in 0.1.x). Symbol shape pinned so callers can compile-time
+  depend on it.
+
+Sequence-type routing:
+- `kFormat`, `kMove`, `kEmbed` Items now route into the root `YArray`
+  alongside `kString/kJson/kBinary/kAny` so rich-text format marks,
+  Y.Move ops, and embedded content participate in the doubly-linked
+  list rather than landing as bare store entries.
+
+Tests: 19 own suites + 13 Yjs JS interop assertions. All green on MSVC
+`/W4 /permissive- /WX`.
+
 ## 0.0.3 — length-N items + rich-content skippers + Yjs JS interior-edit interop
 
 CRDT wire-format completeness:

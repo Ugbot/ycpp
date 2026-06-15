@@ -30,6 +30,7 @@
 #include "ycpp_hashmap.h"
 #include "ycpp_id.h"
 #include "ycpp_item.h"
+#include "ycpp_move.h"
 #include "ycpp_pool.h"
 #include "ycpp_state_vector.h"
 #include "ycpp_status.h"
@@ -37,6 +38,7 @@
 #include "ycpp_unicode.h"
 #include "ycpp_update.h"
 #include "ycpp_writer.h"
+#include "ycpp_subdoc.h"
 #include "ycpp_yarray.h"
 #include "ycpp_ymap.h"
 #include "ycpp_ytext.h"
@@ -55,6 +57,7 @@ public:
           deletes_(&alloc_),
           roots_(&alloc_),
           arrays_(&alloc_),
+          sub_docs_(&alloc_),
           client_id_(client_id),
           next_clock_(0) {}
 
@@ -325,6 +328,63 @@ public:
     [[nodiscard]] const DeleteSet<A>&   delete_set () const noexcept { return deletes_; }
     [[nodiscard]] A&                    allocator  ()       noexcept { return alloc_; }
 
+    // Compact: walk the store and convert kFlagDeleted Items whose
+    // content payload is no longer load-bearing (no live item refers to
+    // them via origin) into kSkip placeholders. Frees `content_view`
+    // bytes; the clock range stays intact so state-vector arithmetic
+    // and downstream find_by_id calls remain consistent.
+    //
+    // Returns the number of Items that were compacted.
+    [[nodiscard]] std::size_t compact() noexcept {
+        std::size_t compacted = 0;
+        store_.for_each_client(
+            [&](uint64_t /*client*/, const Item* const* items,
+                std::size_t count) noexcept {
+                for (std::size_t i = 0; i < count; ++i) {
+                    Item* it = const_cast<Item*>(items[i]);
+                    if ((it->flags & kFlagDeleted) == 0) continue;
+                    if (it->content_kind == ContentKind::kSkip) continue;
+                    if (it->content_kind == ContentKind::kGc)   continue;
+                    if (is_origin_referent(it->id)) continue;  // still anchoring something
+
+                    it->content_kind = ContentKind::kSkip;
+                    it->content_view = ByteView{};
+                    it->parent_sub   = ByteView{};
+                    ++compacted;
+                }
+            });
+        return compacted;
+    }
+
+private:
+    // True if any live item in the store references `target` via its
+    // origin_left or origin_right. Conservative — bounded by total
+    // items.
+    [[nodiscard]] bool is_origin_referent(Id target) const noexcept {
+        bool found = false;
+        store_.for_each_client(
+            [&](uint64_t /*client*/, const Item* const* items,
+                std::size_t count) noexcept {
+                if (found) return;
+                for (std::size_t i = 0; i < count; ++i) {
+                    const Item* it = items[i];
+                    if (id_range_contains(it->origin_left,  target) ||
+                        id_range_contains(it->origin_right, target)) {
+                        found = true;
+                        return;
+                    }
+                }
+            });
+        return found;
+    }
+
+    [[nodiscard]] static bool id_range_contains(Id origin, Id target) noexcept {
+        if (!is_valid(origin)) return false;
+        return origin == target;
+    }
+
+public:
+
 private:
     [[nodiscard]] Status apply_one(const DecodedStruct& d) noexcept {
         if (store_.find_by_id(d.id) != nullptr) return Status::kOk;
@@ -376,13 +436,19 @@ private:
              d.content_kind == ContentKind::kBinary  ||
              d.content_kind == ContentKind::kAny);
 
+        const bool is_sequence_kind =
+            is_value_kind                                ||
+            d.content_kind == ContentKind::kFormat       ||
+            d.content_kind == ContentKind::kMove         ||
+            d.content_kind == ContentKind::kEmbed;
+
         const bool is_map_value =
             (it->parent_ref      == ParentRef::kRootName) &&
             (it->parent_sub.size > 0) && is_value_kind;
 
         const bool is_array_item =
             (it->parent_ref      == ParentRef::kRootName) &&
-            (it->parent_sub.size == 0) && is_value_kind;
+            (it->parent_sub.size == 0) && is_sequence_kind;
 
         if (is_map_value) {
             YMap<A>* m = get_or_create_map(it->parent_name);
@@ -393,6 +459,13 @@ private:
             YArray<A>* arr = get_or_create_array(it->parent_name);
             if (arr == nullptr) { item_pool_.release(it); return Status::kOutOfMemory; }
             return install_into_array(it, arr);
+        }
+        // Sub-doc: parse guid + opts into the registry. The Item itself
+        // also lands in the store as a bare entry so re-emit stays
+        // byte-correct.
+        if (d.content_kind == ContentKind::kDoc) {
+            const Status sd = sub_docs_.install(d.id, it->content_view);
+            if (sd != Status::kOk) { item_pool_.release(it); return sd; }
         }
         return install_bare(it);
     }
@@ -445,6 +518,19 @@ private:
         const Status s = store_.append(it);
         if (s != Status::kOk) { item_pool_.release(it); return s; }
         YCPP_TRY(arr->integrate(it, store_));
+        // Y.Move: decode the op + relocate source range.
+        if (it->content_kind == ContentKind::kMove) {
+            MoveOp mv{};
+            const Status ds = decode_move(it->content_view, &mv);
+            if (ds == Status::kOk) {
+                const Status as = apply_move<A>(it, mv, store_);
+                // kPendingReference means the source isn't yet in the
+                // store — caller's multi-pass apply will retry later.
+                if (as != Status::kOk && as != Status::kPendingReference) {
+                    return as;
+                }
+            }
+        }
         bump_clock_for(it);
         return Status::kOk;
     }
@@ -528,8 +614,13 @@ private:
     HashMap<ByteView, YArray<A>*, A,
             ymap_detail::ByteViewHash,
             ymap_detail::ByteViewEq>    arrays_;
+    SubDocRegistry<A>                   sub_docs_;
     uint64_t                            client_id_;
     uint64_t                            next_clock_;
+
+public:
+    [[nodiscard]] SubDocRegistry<A>&       sub_docs()       noexcept { return sub_docs_; }
+    [[nodiscard]] const SubDocRegistry<A>& sub_docs() const noexcept { return sub_docs_; }
 };
 
 // ----- encode_diff_v1 -------------------------------------------------------

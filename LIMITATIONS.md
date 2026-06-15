@@ -36,20 +36,24 @@ verbatim so the encoder can echo it back. A Yjs doc that uses rich
 text format ranges or nested types round-trips through ycpp without
 loss of bytes.
 
-## Still on the deferred list
+## Still on the deferred list (0.1.x targets)
 
-- **Y.Text rich-text rendering**: format marks (`kFormat`) round-trip
-  on the wire but ycpp doesn't surface a `delta()`-style API. Consumers
-  see the format Items as opaque entries; building a rich-text view
-  layer is up to the caller.
-- **Sub-doc materialization**: `kDoc` content survives round-trip but
-  ycpp does not materialize the nested `Doc`.
-- **Y.Move re-anchoring**: `kMove` survives round-trip; the move
-  semantics (relocating an item to a new position) are not applied.
-- **UndoManager**: not shipped; callers maintain their own undo stack.
-- **GC / compaction**: long-lived docs accumulate tombstones.
-- **updateV2 wire format**: ycpp speaks updateV1 only. Yjs's default
-  `encodeStateAsUpdate` is v1; v2 is opt-in via `encodeStateAsUpdateV2`.
+- **updateV2 wire format**: ycpp 0.0.4 ships the `apply_update_v2` /
+  `encode_diff_v2` public surface but the bodies return
+  `kUnsupportedFormat` — the multi-stream RLE encoder/decoder is the
+  largest single remaining task. Most Yjs clients use v1 by default;
+  `Y.encodeStateAsUpdate` (the common entry point) is v1.
+- **Sub-doc full materialization**: `SubDocRegistry` parses guid + opts
+  bytes. Spawning a child `Doc<A>` instance that shares clock-space and
+  sync semantics with the parent is the remaining piece.
+- **Y.Move under concurrent moves**: ycpp applies a single Move op by
+  re-linking the source range after the carrier. Yjs's full algorithm
+  uses the move's `priority` byte to tie-break concurrent moves of
+  overlapping ranges; we currently honour the first move applied.
+- **Y.Text delta with structured attributes**: `YText::delta()` emits
+  format payloads as raw bytes (varString key + varString value-JSON);
+  decoding the JSON value into an attribute map is left to the caller
+  so ycpp stays JSON-decoder-free.
 
 ## Non-Yjs limits worth knowing
 

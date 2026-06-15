@@ -69,6 +69,59 @@ public:
         });
     }
 
+    // ---- delta() — Yjs-style {insert, attributes} sequence ------------
+    //
+    // Walks the array in document order; for each live text chunk emits
+    // an `Insert` entry carrying the text bytes plus the list of
+    // currently-active format Items (their raw key+value-JSON byte
+    // payloads). Format Items along the way appear as `Format` entries
+    // so the caller can interpret attribute changes.
+    //
+    // The format payloads are passed verbatim — ycpp doesn't link a
+    // JSON decoder. Callers that want a structured `{ key: value }`
+    // attribute map parse the lib0/any payload themselves.
+
+    enum class DeltaKind : uint8_t { kInsert, kFormat };
+
+    struct DeltaEntry {
+        DeltaKind             kind;
+        ByteView              text;             // Insert: text bytes
+        const ByteView*       active_formats;   // Insert: array of active format payloads
+        std::size_t           active_format_n;
+        ByteView              format_payload;   // Format: raw key+value-JSON bytes
+        bool                  format_is_deleted;
+    };
+
+    template <class Fn>
+    void delta(Fn&& on_entry) const noexcept {
+        constexpr std::size_t kMaxActiveFormats = 32;
+        ByteView active[kMaxActiveFormats];
+        std::size_t active_n = 0;
+
+        for (const Item* it = arr_->raw_start(); it != nullptr; it = it->right) {
+            if (it->content_kind == ContentKind::kFormat) {
+                const bool deleted = (it->flags & kFlagDeleted) != 0;
+                DeltaEntry e{};
+                e.kind              = DeltaKind::kFormat;
+                e.format_payload    = it->content_view;
+                e.format_is_deleted = deleted;
+                on_entry(e);
+                if (!deleted && active_n < kMaxActiveFormats) {
+                    active[active_n++] = it->content_view;
+                }
+                continue;
+            }
+            if ((it->flags & kFlagDeleted) != 0) continue;
+            if (it->content_view.size == 0) continue;
+            DeltaEntry e{};
+            e.kind             = DeltaKind::kInsert;
+            e.text             = it->content_view;
+            e.active_formats   = active;
+            e.active_format_n  = active_n;
+            on_entry(e);
+        }
+    }
+
 private:
     YArray<A>* arr_;
 };
