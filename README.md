@@ -96,10 +96,11 @@ app-defined RPC. See `include/ycpp/ycpp_envelope.h` for details and
 ```
 ycpp_byteview.h      ycpp_status.h       ycpp_id.h           ycpp_varint.h
 ycpp_reader.h        ycpp_writer.h       ycpp_arena.h        ycpp_pool.h
-ycpp_ring.h          ycpp_hashmap.h
+ycpp_ring.h          ycpp_hashmap.h      ycpp_unicode.h
 ycpp_item.h          ycpp_delete_set.h   ycpp_struct_store.h
-ycpp_state_vector.h  ycpp_update.h       ycpp_doc.h
-ycpp_ymap.h          ycpp_yarray.h       ycpp_ytext.h
+ycpp_state_vector.h  ycpp_update.h       ycpp_update_v2.h    ycpp_doc.h
+ycpp_ymap.h          ycpp_yarray.h       ycpp_ytext.h        ycpp_move.h
+ycpp_subdoc.h        ycpp_undo.h
 ycpp_envelope.h      ycpp_protocol.h     ycpp_awareness.h
 ```
 
@@ -107,11 +108,32 @@ One `#include <ycpp/ycpp.h>` pulls everything.
 
 ## Status
 
-ycpp **0.0.2** — alpha. The W1 + W2 + W3 + W4 core lands (17 test suites
-under MSVC `/W4 /WX`). See [`LIMITATIONS.md`](LIMITATIONS.md) for the
-parts of Yjs's full surface that aren't shipped yet (updateV2 encoder,
-full Yjs JS interop verification, format ranges in Y.Text, Y.Move,
-sub-docs, XML types, UndoManager, GC).
+ycpp **0.0.4** — alpha. Core CRDT runtime (Doc, YMap LWW, YArray with
+full YATA, YText with `delta()`), wire layer (updateV1 codec), RPC
+framing (Envelope / sync protocol / Awareness), UndoManager,
+`Doc::compact()` (GC), `SubDocRegistry`, Y.Move re-anchoring. 19 own
+test suites + 13 assertions against the real `yjs` npm package, all
+green under MSVC `/W4 /permissive- /WX`. See
+[`CHANGELOG.md`](CHANGELOG.md) for the per-release feature list and
+[`LIMITATIONS.md`](LIMITATIONS.md) for what isn't yet implemented.
+
+### A note on updateV2
+
+ycpp speaks **updateV1 only**. The `apply_update_v2` /
+`encode_diff_v2` symbols exist in
+[`ycpp_update_v2.h`](include/ycpp/ycpp_update_v2.h) and return
+`Status::kUnsupportedFormat` — the public surface is pinned so future
+implementation lands without breaking callers.
+
+The decision to skip v2 for now is deliberate: Yjs JS defaults to v1
+(`Y.encodeStateAsUpdate` is the v1 entry point), v2 is opt-in via
+`Y.encodeStateAsUpdateV2`, and v2's only benefit is wire-size
+compression (~30–50% on typical text workloads) — no new CRDT
+semantics, no new content kinds. Implementing v2 means writing four
+custom RLE/diff-RLE/optional-RLE encoders and a multi-stream cursor
+abstraction; ~1500 LOC of bit-fiddly wire code with no testable
+behavioural payoff for clients on v1. We'll land it when a real use
+case shows up. If you need v2 today, open an issue.
 
 ## License
 

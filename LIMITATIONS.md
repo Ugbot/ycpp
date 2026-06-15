@@ -38,11 +38,21 @@ loss of bytes.
 
 ## Still on the deferred list (0.1.x targets)
 
-- **updateV2 wire format**: ycpp 0.0.4 ships the `apply_update_v2` /
-  `encode_diff_v2` public surface but the bodies return
-  `kUnsupportedFormat` — the multi-stream RLE encoder/decoder is the
-  largest single remaining task. Most Yjs clients use v1 by default;
-  `Y.encodeStateAsUpdate` (the common entry point) is v1.
+- **updateV2 wire format** — deliberately skipped, not a TODO. ycpp
+  0.0.4 ships the `apply_update_v2` / `encode_diff_v2` public surface
+  (so callers can compile-time depend on it) but the bodies return
+  `kUnsupportedFormat`. Rationale:
+  - Yjs JS defaults to v1 (`Y.encodeStateAsUpdate` is v1; v2 is
+    opt-in via `Y.encodeStateAsUpdateV2`).
+  - v2's only benefit is wire-size compression (~30–50% on typical
+    text workloads) — no new CRDT semantics, no new content kinds.
+  - Implementing it means ~1500 LOC of bit-fiddly stream encoders
+    (RLE / IntDiffOptRle / UintOptRle / StringEncoder) plus a
+    multi-stream cursor abstraction — no behavioural payoff while the
+    v1-default ecosystem covers our consumers.
+  - The symbol shape is pinned, so future v2 implementation lands
+    without breaking callers. We'll do it when a real use case
+    shows up. If you need v2 today, open an issue.
 - **Sub-doc full materialization**: `SubDocRegistry` parses guid + opts
   bytes. Spawning a child `Doc<A>` instance that shares clock-space and
   sync semantics with the parent is the remaining piece.
