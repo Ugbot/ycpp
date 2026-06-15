@@ -49,7 +49,6 @@ ycpp_apply_hardening(ycpp_headers)
 # waves add per-module TUs (struct store, integration, encoders, types …).
 add_library(ycpp_static STATIC
     src/ycpp_placeholder.cpp
-    src/ycpp_update_decode_v1.cpp
 )
 add_library(ycpp::ycpp ALIAS ycpp_static)
 target_link_libraries(ycpp_static PUBLIC ycpp::headers)

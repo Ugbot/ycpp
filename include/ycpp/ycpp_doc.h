@@ -1,28 +1,28 @@
-// ycpp_doc.h — Doc<A>: the orchestrator.
+// ycpp_doc.h — Doc<A>: the orchestrator + encode_diff_v1 (the write path).
 //
 // A Doc owns:
-//   - an allocator policy `A` (templated; default = DefaultArenaAllocator,
-//     production gestaltd uses ybolt::BoltArenaAllocator over bolt::Arena)
-//   - a pool of Item nodes (per-object reuse during GC; W8)
-//   - a StructStore<A> (per-client sorted vectors)
-//   - a DeleteSet<A> (per-client RLE delete ranges)
-//   - a hashmap of root YMap<A>* keyed by root name
-//   - a Lamport clock counter (this peer's next clock)
+//   - an allocator policy `A` (concept-constrained; default = DefaultArenaAllocator)
+//   - typed Item pool + YMap pool (per-object reuse)
+//   - StructStore<A> (per-client sorted Item* vectors)
+//   - DeleteSet<A>   (per-client RLE delete ranges)
+//   - root YMap<A>* hashmap keyed by root name (arena-owned ByteView keys)
+//   - this peer's Lamport clock counter
 //
-// Public surface (W3+W5):
-//   apply_update_v1   — integrate an incoming wire update
-//   state_vector      — fill out this Doc's state vector
-//   encode_diff_v1    — emit a v1 update carrying everything `since` is
-//                       missing
-//   get_or_create_map — root-level Y.Map by name
+// W3 LWW Y.Map model: insertions whose `parent_ref == kRootName` and
+// `content_kind in {kString, kJson, kBinary}` route into the named root
+// YMap; the head pointer per key follows last-writer-wins by Lamport
+// order. Anything else lives in the store but isn't routed into a type
+// (W4+ adds Y.Array / Y.Text / nested types).
 //
-// Non-thread-safe per Doc. Caller serialises concurrent access.
+// Single-threaded per Doc.
 
 #pragma once
 
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <utility>
 
 #include "ycpp_arena.h"
 #include "ycpp_byteview.h"
@@ -35,6 +35,7 @@
 #include "ycpp_status.h"
 #include "ycpp_struct_store.h"
 #include "ycpp_update.h"
+#include "ycpp_writer.h"
 #include "ycpp_ymap.h"
 
 namespace ycpp {
@@ -57,41 +58,32 @@ public:
     Doc(Doc&&)                 = delete;
     Doc& operator=(Doc&&)      = delete;
 
-    ~Doc() noexcept = default;  // arena owns the storage
+    ~Doc() noexcept = default;
 
     [[nodiscard]] uint64_t client_id () const noexcept { return client_id_; }
     [[nodiscard]] uint64_t next_clock() const noexcept { return next_clock_; }
 
-    // --- root Y.Map access ----------------------------------------------------
+    // --- root Y.Map access ---------------------------------------------------
     [[nodiscard]] YMap<A>* get_or_create_map(ByteView name) noexcept {
         auto* hit = roots_.find(name);
         if (hit != nullptr) return hit->value;
-        // Copy the name into arena-owned storage so the hashmap key outlives
-        // the caller's buffer.
         ByteView owned = clone_view(name);
         if (owned.data == nullptr && name.size != 0) return nullptr;
         YMap<A>* m = ymap_pool_.acquire(&alloc_);
         if (m == nullptr) return nullptr;
         auto [entry, inserted] = roots_.insert(owned, m);
-        if (!inserted) {
-            ymap_pool_.release(m);
-            return entry->value;
-        }
+        if (!inserted) { ymap_pool_.release(m); return entry->value; }
         return m;
     }
 
     [[nodiscard]] YMap<A>* get_or_create_map(const char* name) noexcept {
-        return get_or_create_map(ByteView{
-            reinterpret_cast<const uint8_t*>(name),
-            name == nullptr ? 0 : std::char_traits<char>::length(name)
-        });
+        if (name == nullptr) return nullptr;
+        std::size_t n = 0;
+        while (name[n] != '\0') ++n;
+        return get_or_create_map(ByteView{reinterpret_cast<const uint8_t*>(name), n});
     }
 
     // --- local edits ---------------------------------------------------------
-    //
-    // Emit a kString Item for `key = value` on the named root map. The
-    // Item lands in the StructStore + the root map's head pointer.
-    // Returns the Item's Id on success.
     [[nodiscard]] Status map_set_string(ByteView root_name, ByteView key,
                                         ByteView value, Id* out_id = nullptr) noexcept {
         YMap<A>* m = get_or_create_map(root_name);
@@ -99,12 +91,13 @@ public:
 
         Item* it = item_pool_.acquire();
         if (it == nullptr) return Status::kOutOfMemory;
+
         ByteView owned_name  = clone_view(root_name);
         ByteView owned_key   = clone_view(key);
         ByteView owned_value = clone_view(value);
-        if ((root_name.size  != 0 && owned_name.data  == nullptr) ||
-            (key.size        != 0 && owned_key.data   == nullptr) ||
-            (value.size      != 0 && owned_value.data == nullptr)) {
+        if ((root_name.size != 0 && owned_name.data  == nullptr) ||
+            (key.size       != 0 && owned_key.data   == nullptr) ||
+            (value.size     != 0 && owned_value.data == nullptr)) {
             item_pool_.release(it);
             return Status::kOutOfMemory;
         }
@@ -119,13 +112,17 @@ public:
         it->content_view  = owned_value;
         it->flags         = 0;
 
-        YCPP_TRY(install_item(it, m));
+        YCPP_TRY(install_into_map(it, m));
         if (out_id != nullptr) *out_id = it->id;
-        ++next_clock_;
         return Status::kOk;
     }
 
-    // --- wire-format I/O -----------------------------------------------------
+    [[nodiscard]] Status map_set_string(const char* root, const char* key,
+                                        const char* value, Id* out_id = nullptr) noexcept {
+        return map_set_string(cstr_view(root), cstr_view(key), cstr_view(value), out_id);
+    }
+
+    // --- wire I/O ------------------------------------------------------------
     [[nodiscard]] Status state_vector(StateVector<A>* out) const noexcept {
         assert(out != nullptr);
         Status acc = Status::kOk;
@@ -141,10 +138,11 @@ public:
     [[nodiscard]] Status apply_update_v1(ByteView bytes) noexcept {
         DecodedUpdate<A> decoded{&alloc_};
         YCPP_TRY(decode_update_v1<A>(bytes, &decoded));
+
         for (std::size_t i = 0; i < decoded.size(); ++i) {
             YCPP_TRY(apply_one(decoded.at(i)));
         }
-        // Merge incoming delete set + actually flag the targets.
+
         Status acc = Status::kOk;
         decoded.delete_set().for_each_client(
             [&](uint64_t client, const DeleteRange* rs, std::size_t n) noexcept {
@@ -158,8 +156,6 @@ public:
         return acc;
     }
 
-    // Access for the encoder. Internals exposed via friends / accessors so the
-    // encoder TU can iterate without crossing the public surface.
     [[nodiscard]] StructStore<A>&       store      ()       noexcept { return store_; }
     [[nodiscard]] const StructStore<A>& store      () const noexcept { return store_; }
     [[nodiscard]] DeleteSet<A>&         delete_set ()       noexcept { return deletes_; }
@@ -168,7 +164,6 @@ public:
 
 private:
     [[nodiscard]] Status apply_one(const DecodedStruct& d) noexcept {
-        // Drop structs whose Id is already in our store (idempotent replay).
         if (store_.find_by_id(d.id) != nullptr) return Status::kOk;
 
         Item* it = item_pool_.acquire();
@@ -184,56 +179,53 @@ private:
         it->length        = d.length;
         it->content_view  = clone_view(d.content_view);
         it->flags         = 0;
-        // Validate that the owned copies didn't fail mid-clone.
-        if ((d.parent_name.size   != 0 && it->parent_name.data   == nullptr) ||
-            (d.parent_sub.size    != 0 && it->parent_sub.data    == nullptr) ||
-            (d.content_view.size  != 0 && it->content_view.data  == nullptr)) {
+        if ((d.parent_name.size  != 0 && it->parent_name.data  == nullptr) ||
+            (d.parent_sub.size   != 0 && it->parent_sub.data   == nullptr) ||
+            (d.content_view.size != 0 && it->content_view.data == nullptr)) {
             item_pool_.release(it);
             return Status::kOutOfMemory;
         }
 
-        // For W3+W4 LWW, only root-Y.Map inserts are integrated into a YMap.
-        // Other content kinds (GC, Deleted, anything without a root parent
-        // name) land in the store and become visible via direct find_by_id
-        // but don't enter any type's view.
-        if (d.parent_ref == ParentRef::kRootName && d.parent_sub.size > 0
-            && (d.content_kind == ContentKind::kString
-             || d.content_kind == ContentKind::kJson
-             || d.content_kind == ContentKind::kBinary)) {
+        const bool is_map_value =
+            (d.parent_ref   == ParentRef::kRootName) &&
+            (d.parent_sub.size > 0) &&
+            (d.content_kind == ContentKind::kString  ||
+             d.content_kind == ContentKind::kJson    ||
+             d.content_kind == ContentKind::kBinary);
+
+        if (is_map_value) {
             YMap<A>* m = get_or_create_map(it->parent_name);
             if (m == nullptr) { item_pool_.release(it); return Status::kOutOfMemory; }
-            YCPP_TRY(install_item(it, m));
-        } else {
-            // Not in a known type — just record in the store; W4+ will route.
-            const Status s = store_.append(it);
-            if (s != Status::kOk) {
-                item_pool_.release(it);
-                return s;
-            }
-            // Keep the local clock ahead of any client we've heard from.
-            if (it->id.client == client_id_ && it->id.clock + it->length > next_clock_) {
-                next_clock_ = it->id.clock + it->length;
-            }
+            return install_into_map(it, m);
         }
+        return install_bare(it);
+    }
+
+    [[nodiscard]] Status install_bare(Item* it) noexcept {
+        const Status s = store_.append(it);
+        if (s != Status::kOk) { item_pool_.release(it); return s; }
+        bump_clock_for(it);
         return Status::kOk;
     }
 
-    [[nodiscard]] Status install_item(Item* it, YMap<A>* m) noexcept {
+    [[nodiscard]] Status install_into_map(Item* it, YMap<A>* m) noexcept {
         const Status s = store_.append(it);
-        if (s != Status::kOk) {
-            item_pool_.release(it);
-            return s;
-        }
+        if (s != Status::kOk) { item_pool_.release(it); return s; }
         Item* loser = m->integrate(it);
         if (loser != nullptr) {
             loser->flags |= kFlagDeleted;
             YCPP_TRY(deletes_.add(loser->id.client, loser->id.clock,
-                                 loser->length == 0 ? 1 : loser->length));
+                                  loser->length == 0 ? 1 : loser->length));
         }
-        if (it->id.client == client_id_ && it->id.clock + it->length > next_clock_) {
-            next_clock_ = it->id.clock + it->length;
-        }
+        bump_clock_for(it);
         return Status::kOk;
+    }
+
+    void bump_clock_for(const Item* it) noexcept {
+        if (it->id.client == client_id_) {
+            const uint64_t end = it->id.clock + (it->length == 0 ? 1 : it->length);
+            if (end > next_clock_) next_clock_ = end;
+        }
     }
 
     void mark_range_deleted(uint64_t client, uint64_t clock_start,
@@ -252,6 +244,13 @@ private:
         return ByteView{dst, v.size};
     }
 
+    [[nodiscard]] static ByteView cstr_view(const char* s) noexcept {
+        if (s == nullptr) return ByteView{};
+        std::size_t n = 0;
+        while (s[n] != '\0') ++n;
+        return ByteView{reinterpret_cast<const uint8_t*>(s), n};
+    }
+
     A                                   alloc_;
     Pool<Item, A>                       item_pool_;
     Pool<YMap<A>, A>                    ymap_pool_;
@@ -264,15 +263,112 @@ private:
     uint64_t                            next_clock_;
 };
 
-// Encoder lives in its own TU; declared here for callers.
-template <Allocator A>
-[[nodiscard]] Status encode_diff_v1(const Doc<A>& doc,
-                                     const StateVector<A>* since,
-                                     Writer* out) noexcept;
+// ----- encode_diff_v1 -------------------------------------------------------
 
-extern template Status encode_diff_v1<DefaultArenaAllocator>(
-    const Doc<DefaultArenaAllocator>&,
-    const StateVector<DefaultArenaAllocator>*,
-    Writer*) noexcept;
+namespace detail_encode {
+
+[[nodiscard]] inline Status write_id(Writer& w, Id id) noexcept {
+    YCPP_TRY(w.varint_u64(id.client));
+    YCPP_TRY(w.varint_u64(id.clock));
+    return Status::kOk;
+}
+
+[[nodiscard]] inline uint8_t build_info_byte(const Item* it) noexcept {
+    uint8_t info = static_cast<uint8_t>(it->content_kind) & kInfoMaskContentKind;
+    if (is_valid(it->origin_left )) info |= kInfoFlagHasLeftOrigin;
+    if (is_valid(it->origin_right)) info |= kInfoFlagHasRightOrigin;
+    if (it->parent_sub.size > 0)    info |= kInfoFlagHasParentSub;
+    return info;
+}
+
+[[nodiscard]] inline Status write_content_payload(Writer& w, const Item* it) noexcept {
+    switch (it->content_kind) {
+        case ContentKind::kGc:
+        case ContentKind::kSkip:
+        case ContentKind::kDeleted:
+            return w.varint_u64(it->length == 0 ? 1 : it->length);
+        case ContentKind::kString:
+        case ContentKind::kJson:
+        case ContentKind::kBinary:
+        case ContentKind::kEmbed:
+        case ContentKind::kAny:
+        case ContentKind::kFormat:
+        case ContentKind::kType:
+        case ContentKind::kDoc:
+        case ContentKind::kMove:
+            return w.length_prefixed(it->content_view.data, it->content_view.size);
+    }
+    return Status::kUnsupportedFormat;
+}
+
+[[nodiscard]] inline Status write_struct(Writer& w, const Item* it) noexcept {
+    assert(it != nullptr);
+    const uint8_t info = build_info_byte(it);
+    YCPP_TRY(w.u8(info));
+    if (info_has_left_origin (info)) YCPP_TRY(write_id(w, it->origin_left));
+    if (info_has_right_origin(info)) YCPP_TRY(write_id(w, it->origin_right));
+    if (info_has_parent_info (info)) {
+        if (it->parent_ref == ParentRef::kId) {
+            YCPP_TRY(w.u8(1));
+            YCPP_TRY(write_id(w, it->parent_id));
+        } else if (it->parent_ref == ParentRef::kRootName) {
+            YCPP_TRY(w.u8(0));
+            YCPP_TRY(w.length_prefixed(it->parent_name.data, it->parent_name.size));
+        } else {
+            return Status::kInternal;
+        }
+    }
+    if (info_has_parent_sub(info)) {
+        YCPP_TRY(w.length_prefixed(it->parent_sub.data, it->parent_sub.size));
+    }
+    return write_content_payload(w, it);
+}
+
+} // namespace detail_encode
+
+// Emit a Yjs updateV1 carrying only the structs whose clock is >=
+// since[client], plus the full DeleteSet (deletions are monotone).
+template <Allocator A>
+[[nodiscard]] inline Status encode_diff_v1(const Doc<A>&         doc,
+                                            const StateVector<A>* since,
+                                            Writer*               out) noexcept {
+    assert(out != nullptr);
+
+    uint64_t n_clients_to_emit = 0;
+    doc.store().for_each_client(
+        [&](uint64_t client, const Item* const* items, std::size_t count) noexcept {
+            const uint64_t since_clock = (since != nullptr) ? since->get(client) : 0U;
+            for (std::size_t i = 0; i < count; ++i) {
+                if (items[i]->id.clock >= since_clock) { ++n_clients_to_emit; return; }
+            }
+        });
+    YCPP_TRY(out->varint_u64(n_clients_to_emit));
+
+    Status acc = Status::kOk;
+    doc.store().for_each_client(
+        [&](uint64_t client, const Item* const* items, std::size_t count) noexcept {
+            if (acc != Status::kOk) return;
+            const uint64_t since_clock = (since != nullptr) ? since->get(client) : 0U;
+
+            std::size_t start = 0;
+            while (start < count && items[start]->id.clock < since_clock) ++start;
+            const std::size_t emit_count = count - start;
+            if (emit_count == 0) return;
+
+            Status s = out->varint_u64(static_cast<uint64_t>(emit_count));
+            if (s != Status::kOk) { acc = s; return; }
+            s = out->varint_u64(client);
+            if (s != Status::kOk) { acc = s; return; }
+            s = out->varint_u64(items[start]->id.clock);
+            if (s != Status::kOk) { acc = s; return; }
+            for (std::size_t i = start; i < count; ++i) {
+                s = detail_encode::write_struct(*out, items[i]);
+                if (s != Status::kOk) { acc = s; return; }
+            }
+        });
+    if (acc != Status::kOk) return acc;
+
+    return doc.delete_set().encode(*out);
+}
 
 } // namespace ycpp

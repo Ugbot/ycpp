@@ -1,9 +1,11 @@
-// ycpp_update.h — public surface of the update wire-format codecs.
+// ycpp_update.h — Yjs updateV1 codec (decoder lives here; encoder is in
+// ycpp_doc.h since it walks a Doc).
 //
-// W2 ships `decode_update_v1`: parse a Yjs updateV1 blob into a flat
-// vector of `DecodedStruct`s + a DeleteSet. Integration (W3) consumes
-// these to splice Items into the Doc; types (W4) interpret the content
-// payloads.
+// The decoder body is inline in this header so any `Allocator` policy
+// instantiates the parser at the call site — including the production
+// `bolt::ybolt::BoltArenaAllocator` binding, which never crosses ycpp's
+// static library boundary. The header stays compact because the parser
+// itself is small (~200 LOC including helpers).
 
 #pragma once
 
@@ -11,18 +13,18 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "ycpp_arena.h"   // for Allocator concept
 #include "ycpp_byteview.h"
 #include "ycpp_delete_set.h"
 #include "ycpp_id.h"
 #include "ycpp_item.h"
+#include "ycpp_reader.h"
 #include "ycpp_status.h"
 
 namespace ycpp {
 
-// One decoded struct from the wire. This is a lightweight POD — the
-// caller-supplied buffer for the update remains the storage backing every
-// ByteView field. The decoded vector is meant to be drained by integration
-// in W3 (where Items get cloned into Doc-owned storage).
+// One decoded struct from the wire. POD; ByteView fields alias the source
+// update buffer — integration must clone before persistence.
 struct DecodedStruct {
     Id            id;
     Id            origin_left;
@@ -33,16 +35,11 @@ struct DecodedStruct {
     ByteView      parent_sub;
     ContentKind   content_kind;
     uint64_t      length;
-    // Raw content bytes — interpretation depends on `content_kind`:
-    //   kString / kJson      → UTF-8 text
-    //   kBinary              → opaque bytes
-    //   kGc / kSkip / kDeleted → empty (length carries the run width)
-    //   everything else      → opaque; parsed in W4
     ByteView      content_view;
 };
 
-// A decoded update is just a pair of (struct vector, delete-set). The
-// vector storage comes from the supplied allocator.
+// A decoded update = (struct vector, delete-set). Storage from the
+// supplied allocator.
 template <Allocator A>
 class DecodedUpdate {
 public:
@@ -57,7 +54,7 @@ public:
     DecodedUpdate(DecodedUpdate&&)                 = delete;
     DecodedUpdate& operator=(DecodedUpdate&&)      = delete;
 
-    ~DecodedUpdate() noexcept = default;  // storage owned by arena
+    ~DecodedUpdate() noexcept = default;
 
     [[nodiscard]] Status push(const DecodedStruct& s) noexcept {
         YCPP_TRY(ensure_cap(size_ + 1));
@@ -65,19 +62,19 @@ public:
         return Status::kOk;
     }
 
-    [[nodiscard]] std::size_t          size  () const noexcept { return size_; }
-    [[nodiscard]] const DecodedStruct* data  () const noexcept { return structs_; }
-    [[nodiscard]] const DecodedStruct& at    (std::size_t i) const noexcept {
+    [[nodiscard]] std::size_t          size () const noexcept { return size_; }
+    [[nodiscard]] const DecodedStruct* data () const noexcept { return structs_; }
+    [[nodiscard]] const DecodedStruct& at   (std::size_t i) const noexcept {
         assert(i < size_);
         return structs_[i];
     }
 
-    [[nodiscard]] DeleteSet<A>&        delete_set()       noexcept { return delete_set_; }
-    [[nodiscard]] const DeleteSet<A>&  delete_set() const noexcept { return delete_set_; }
+    [[nodiscard]] DeleteSet<A>&       delete_set()       noexcept { return delete_set_; }
+    [[nodiscard]] const DeleteSet<A>& delete_set() const noexcept { return delete_set_; }
 
 private:
     static constexpr std::size_t kInitialCap = 32;
-    static constexpr std::size_t kMaxStructs = 1U << 26;  // 64M structs cap
+    static constexpr std::size_t kMaxStructs = 1U << 26;
 
     [[nodiscard]] Status ensure_cap(std::size_t need) noexcept {
         if (need <= cap_) return Status::kOk;
@@ -103,15 +100,130 @@ private:
     DeleteSet<A>   delete_set_;
 };
 
-// Parse a Yjs updateV1 binary blob `bytes` into `out`. The DecodedUpdate's
-// ByteView fields alias `bytes`; the caller must keep `bytes` alive while
-// `out` is used.
-template <Allocator A>
-[[nodiscard]] Status decode_update_v1(ByteView bytes, DecodedUpdate<A>* out) noexcept;
+// ----- decoder ---------------------------------------------------------------
 
-// Extern instantiation for the default allocator — keeps consumers who use
-// the default Doc from re-compiling the whole decoder template.
-extern template Status decode_update_v1<DefaultArenaAllocator>(
-    ByteView, DecodedUpdate<DefaultArenaAllocator>*) noexcept;
+namespace detail_decode {
+
+inline constexpr std::size_t kMaxClientsPerUpdate = 4096;
+inline constexpr std::size_t kMaxStructsPerClient = 1U << 24;
+
+[[nodiscard]] inline Status read_id(Reader& r, Id* out) noexcept {
+    assert(out != nullptr);
+    uint64_t client = 0, clock = 0;
+    YCPP_TRY(r.varint_u64(&client));
+    YCPP_TRY(r.varint_u64(&clock));
+    *out = Id{client, clock};
+    return Status::kOk;
+}
+
+[[nodiscard]] inline Status read_content_payload(Reader& r, ContentKind kind,
+                                                  uint64_t* length,
+                                                  ByteView* payload) noexcept {
+    assert(length  != nullptr);
+    assert(payload != nullptr);
+    *length  = 1;
+    *payload = ByteView{};
+    switch (kind) {
+        case ContentKind::kGc:
+        case ContentKind::kSkip:
+        case ContentKind::kDeleted:
+            YCPP_TRY(r.varint_u64(length));
+            if (*length == 0) return Status::kCorruptInput;
+            return Status::kOk;
+
+        case ContentKind::kString:
+        case ContentKind::kJson:
+        case ContentKind::kBinary:
+        case ContentKind::kEmbed:
+        case ContentKind::kAny:
+        case ContentKind::kFormat:
+        case ContentKind::kType:
+        case ContentKind::kDoc:
+        case ContentKind::kMove:
+            YCPP_TRY(r.length_prefixed(payload));
+            *length = 1;
+            return Status::kOk;
+    }
+    return Status::kUnsupportedFormat;
+}
+
+[[nodiscard]] inline Status decode_one_struct(Reader& r, uint64_t client,
+                                              uint64_t clock,
+                                              DecodedStruct* out) noexcept {
+    assert(out != nullptr);
+    uint8_t info = 0;
+    YCPP_TRY(r.u8(&info));
+    if (!content_kind_is_known(info & kInfoMaskContentKind)) {
+        return Status::kUnsupportedFormat;
+    }
+
+    out->id            = Id{client, clock};
+    out->origin_left   = kInvalidId;
+    out->origin_right  = kInvalidId;
+    out->parent_ref    = ParentRef::kNone;
+    out->parent_id     = kInvalidId;
+    out->parent_name   = ByteView{};
+    out->parent_sub    = ByteView{};
+    out->content_kind  = info_content_kind(info);
+    out->length        = 1;
+    out->content_view  = ByteView{};
+
+    if (info_has_left_origin (info)) YCPP_TRY(read_id(r, &out->origin_left));
+    if (info_has_right_origin(info)) YCPP_TRY(read_id(r, &out->origin_right));
+    if (info_has_parent_info (info)) {
+        uint8_t parent_tag = 0;
+        YCPP_TRY(r.u8(&parent_tag));
+        if (parent_tag == 1) {
+            out->parent_ref = ParentRef::kId;
+            YCPP_TRY(read_id(r, &out->parent_id));
+        } else if (parent_tag == 0) {
+            out->parent_ref = ParentRef::kRootName;
+            YCPP_TRY(r.length_prefixed(&out->parent_name));
+        } else {
+            return Status::kCorruptInput;
+        }
+    }
+    if (info_has_parent_sub(info)) {
+        YCPP_TRY(r.length_prefixed(&out->parent_sub));
+    }
+
+    return read_content_payload(r, out->content_kind, &out->length, &out->content_view);
+}
+
+} // namespace detail_decode
+
+// Parse a Yjs updateV1 binary blob `bytes` into `out`. ByteView fields in
+// `out` alias `bytes`; the caller must keep `bytes` alive while reading
+// from `out`. Integration into a Doc clones into Doc-owned storage.
+template <Allocator A>
+[[nodiscard]] inline Status decode_update_v1(ByteView bytes,
+                                              DecodedUpdate<A>* out) noexcept {
+    assert(out != nullptr);
+    Reader r{bytes};
+
+    uint64_t n_clients = 0;
+    YCPP_TRY(r.varint_u64(&n_clients));
+    if (n_clients > detail_decode::kMaxClientsPerUpdate) return Status::kCapacityExceeded;
+
+    for (uint64_t ci = 0; ci < n_clients; ++ci) {
+        uint64_t n_structs = 0;
+        uint64_t client    = 0;
+        uint64_t clock     = 0;
+        YCPP_TRY(r.varint_u64(&n_structs));
+        if (n_structs > detail_decode::kMaxStructsPerClient) return Status::kCapacityExceeded;
+        YCPP_TRY(r.varint_u64(&client));
+        YCPP_TRY(r.varint_u64(&clock));
+        for (uint64_t si = 0; si < n_structs; ++si) {
+            DecodedStruct s{};
+            YCPP_TRY(detail_decode::decode_one_struct(r, client, clock, &s));
+            YCPP_TRY(out->push(s));
+            clock += s.length == 0 ? 1 : s.length;
+        }
+    }
+
+    YCPP_TRY(out->delete_set().decode(r));
+    if (!r.eof()) return Status::kCorruptInput;
+    return Status::kOk;
+}
 
 } // namespace ycpp

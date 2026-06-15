@@ -26,3 +26,8 @@ ycpp_add_test(test_ycpp_id)
 ycpp_add_test(test_ycpp_delete_set)
 ycpp_add_test(test_ycpp_struct_store)
 ycpp_add_test(test_ycpp_decode_v1)
+
+# W3 — Doc + Y.Map LWW + state vector + encode_diff_v1 + two-doc convergence
+ycpp_add_test(test_ycpp_state_vector)
+ycpp_add_test(test_ycpp_doc)
+ycpp_add_test(test_ycpp_convergence)
