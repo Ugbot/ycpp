@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+# ycpp has ZERO external runtime dependencies (C++20 standard library only),
+# so there is nothing to find_dependency() here. If that ever changes, the
+# find_dependency() calls belong ABOVE the include() below.
+
+include("${CMAKE_CURRENT_LIST_DIR}/ycpp-targets.cmake")
+
+check_required_components(ycpp)

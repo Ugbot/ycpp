@@ -18,5 +18,14 @@ if(NOT GTest_FOUND)
     )
     # Match the MSVC runtime of our own code (dynamic CRT).
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+
+    # Do NOT let the fetched GoogleTest add its own install rules. Without
+    # this, `cmake --install` on a tests-enabled ycpp build drops gtest's
+    # headers, four static archives, lib/cmake/GTest/ and four .pc files into
+    # the caller's prefix — ycpp would be shipping somebody else's library
+    # under its own install, and could silently shadow a system GoogleTest.
+    # gtest is a test-only dependency; it has no business in ycpp's package.
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+
     FetchContent_MakeAvailable(googletest)
 endif()
