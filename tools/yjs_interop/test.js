@@ -212,6 +212,36 @@ function check(name, cond, detail = '') {
     }
 }
 
+// ----- Test 4: Y.Map overwrite chains (origin-bearing map items) -----------
+{
+    console.log('\n[4] Y.Map overwrite chains (causal + concurrent)');
+    const hi = new Y.Doc(); hi.clientID = 0x22;
+    const lo = new Y.Doc(); lo.clientID = 0x11;
+    hi.getMap('members').set('22', 'alive');
+    Y.applyUpdate(lo, Y.encodeStateAsUpdate(hi));
+    lo.getMap('members').set('22', 'dead');          // causal: lower client wins
+    hi.getMap('members').set('k', 'h1');
+    lo.getMap('members').set('k', 'l1');             // concurrent: higher client wins
+    lo.getMap('members').set('k', 'l2');
+    Y.applyUpdate(hi, Y.encodeStateAsUpdate(lo));
+    Y.applyUpdate(lo, Y.encodeStateAsUpdate(hi));
+    const want = lo.getMap('members').toJSON();
+    const a = runCli(['apply-and-emit'], Y.encodeStateAsUpdate(hi));
+    check('apply-and-emit exits 0 on overwrite chains', a.code === 0,
+          `exit=${a.code} stderr=${a.stderr.trim()}`);
+    if (a.code === 0 && a.stdout.length > 0) {
+        const back = new Y.Doc();
+        try {
+            Y.applyUpdate(back, a.stdout);
+            const got = back.getMap('members').toJSON();
+            check('round-trip map matches Yjs', JSON.stringify(got) === JSON.stringify(want),
+                  `got=${JSON.stringify(got)} want=${JSON.stringify(want)}`);
+        } catch (e) {
+            check('round-trip applies cleanly to fresh Y.Doc', false, e.message);
+        }
+    }
+}
+
 console.log('\n----------------------------------------');
 console.log(`results: ${pass} passed, ${fail} failed`);
 if (fail > 0) {

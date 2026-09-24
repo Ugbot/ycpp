@@ -138,6 +138,10 @@ public:
         }
         it->id            = Id{client_id_, next_clock_};
         it->origin_left   = kInvalidId;
+        if (const Item* prior = m->raw_head(owned_key); prior != nullptr) {
+            const uint64_t len = prior->length == 0 ? 1 : prior->length;
+            it->origin_left = Id{prior->id.client, prior->id.clock + len - 1};
+        }
         it->origin_right  = kInvalidId;
         it->parent_ref    = ParentRef::kRootName;
         it->parent_name   = owned_name;
@@ -349,7 +353,6 @@ public:
 
                     it->content_kind = ContentKind::kSkip;
                     it->content_view = ByteView{};
-                    it->parent_sub   = ByteView{};
                     ++compacted;
                 }
             });
@@ -485,7 +488,9 @@ private:
                 it->parent_ref  = pred->parent_ref;
                 it->parent_id   = pred->parent_id;
                 it->parent_name = pred->parent_name;  // arena-owned; shared aliasing is safe
-                // parent_sub is per-item (LWW Y.Map key); don't inherit.
+                // Yjs: parentSub is copied from the origin (map overwrite
+                // chains); sequence items have none to copy.
+                if (it->parent_sub.size == 0) it->parent_sub = pred->parent_sub;
                 return;
             }
             cursor = is_valid(pred->origin_left)  ? pred->origin_left
@@ -504,7 +509,7 @@ private:
     [[nodiscard]] Status install_into_map(Item* it, YMap<A>* m) noexcept {
         const Status s = store_.append(it);
         if (s != Status::kOk) { item_pool_.release(it); return s; }
-        Item* loser = m->integrate(it);
+        Item* loser = m->integrate(it, store_);
         if (loser != nullptr) {
             loser->flags |= kFlagDeleted;
             YCPP_TRY(deletes_.add(loser->id.client, loser->id.clock,
@@ -637,7 +642,9 @@ namespace detail_encode {
     uint8_t info = static_cast<uint8_t>(it->content_kind) & kInfoMaskContentKind;
     if (is_valid(it->origin_left )) info |= kInfoFlagHasLeftOrigin;
     if (is_valid(it->origin_right)) info |= kInfoFlagHasRightOrigin;
-    if (it->parent_sub.size > 0)    info |= kInfoFlagHasParentSub;
+    const bool skip_like = it->content_kind == ContentKind::kGc ||
+                           it->content_kind == ContentKind::kSkip;
+    if (it->parent_sub.size > 0 && !skip_like) info |= kInfoFlagHasParentSub;
     return info;
 }
 
@@ -684,7 +691,7 @@ namespace detail_encode {
             return Status::kInternal;
         }
     }
-    if (info_has_parent_sub(info)) {
+    if (info_has_parent_sub(info) && info_has_parent_info(info)) {
         YCPP_TRY(w.length_prefixed(it->parent_sub.data, it->parent_sub.size));
     }
     return write_content_payload(w, it);

@@ -367,7 +367,9 @@ inline constexpr int         kMaxAnyDepth         = 64;
             return Status::kCorruptInput;
         }
     }
-    if (info_has_parent_sub(info)) {
+    // Yjs writes the key only alongside explicit parent info; otherwise it
+    // is inherited from the origin at integration.
+    if (info_has_parent_sub(info) && info_has_parent_info(info)) {
         YCPP_TRY(r.length_prefixed(&out->parent_sub));
     }
 

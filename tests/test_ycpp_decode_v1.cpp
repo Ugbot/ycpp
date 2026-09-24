@@ -120,15 +120,13 @@ TEST(YcppDecodeV1, TwoStructsWithOriginsAndParentSub) {
         b.emit_length_prefixed(ByteView{reinterpret_cast<const uint8_t*>(content),
                                         std::strlen(content)});
     }
-    // Struct 1: kString, left-origin = (11, 0), no parent info, parent_sub="k".
+    // Struct 1: kString, left-origin = (11, 0), no parent info. Yjs sets
+    // the parent-sub bit but omits the key; it is copied from the origin.
     {
         b.emit_u8(static_cast<uint8_t>(ContentKind::kString)
                   | kInfoFlagHasLeftOrigin
                   | kInfoFlagHasParentSub);
         b.emit_varint(11); b.emit_varint(0);  // origin_left = (11, 0)
-        const char* sub = "k";
-        b.emit_length_prefixed(ByteView{reinterpret_cast<const uint8_t*>(sub),
-                                        std::strlen(sub)});
         const char* content = "v1";
         b.emit_length_prefixed(ByteView{reinterpret_cast<const uint8_t*>(content),
                                         std::strlen(content)});
@@ -146,8 +144,9 @@ TEST(YcppDecodeV1, TwoStructsWithOriginsAndParentSub) {
     EXPECT_EQ(out.at(1).id, (Id{11, 2}));
     EXPECT_EQ(out.at(1).origin_left, (Id{11, 0}));
     EXPECT_EQ(out.at(1).parent_ref,   ParentRef::kNone);
-    ASSERT_EQ(out.at(1).parent_sub.size, 1U);
-    EXPECT_EQ(out.at(1).parent_sub.data[0], 'k');
+    EXPECT_EQ(out.at(1).parent_sub.size, 0U);
+    ASSERT_EQ(out.at(0).parent_sub.size, 1U);
+    EXPECT_EQ(out.at(0).parent_sub.data[0], 'k');
 }
 
 TEST(YcppDecodeV1, GcStructEncodesLength) {
