@@ -72,6 +72,29 @@ public:
     [[nodiscard]] uint64_t next_clock() const noexcept { return next_clock_; }
 
     // --- root Y.Map access ---------------------------------------------------
+    // Lookup never creates a root or allocates. Borrowed pointer lives with Doc.
+    [[nodiscard]] YMap<A>* find_map(ByteView name) noexcept {
+        assert(name.data != nullptr || name.size == 0);
+        const auto* hit = roots_.find(name);
+        assert(hit == nullptr || hit->value != nullptr);
+        return hit == nullptr ? nullptr : hit->value;
+    }
+
+    [[nodiscard]] const YMap<A>* find_map(ByteView name) const noexcept {
+        assert(name.data != nullptr || name.size == 0);
+        const auto* hit = roots_.find(name);
+        assert(hit == nullptr || hit->value != nullptr);
+        return hit == nullptr ? nullptr : hit->value;
+    }
+
+    [[nodiscard]] YMap<A>* find_map(const char* name) noexcept {
+        return name == nullptr ? nullptr : find_map(cstr_view(name));
+    }
+
+    [[nodiscard]] const YMap<A>* find_map(const char* name) const noexcept {
+        return name == nullptr ? nullptr : find_map(cstr_view(name));
+    }
+
     [[nodiscard]] YMap<A>* get_or_create_map(ByteView name) noexcept {
         auto* hit = roots_.find(name);
         if (hit != nullptr) return hit->value;

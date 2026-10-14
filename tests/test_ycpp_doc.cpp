@@ -34,6 +34,28 @@ std::string_view as_sv(ByteView b) noexcept {
 
 } // namespace
 
+TEST(YcppDoc, FindMapNeverCreatesOrAllocates) {
+    DocA doc{1};
+    const auto empty_bytes=doc.allocator().bytes_in_use();
+    const DocA& readonly=doc;
+    EXPECT_EQ(doc.find_map("missing"),nullptr);
+    EXPECT_EQ(readonly.find_map(sv("missing")),nullptr);
+    EXPECT_EQ(doc.next_clock(),0u);
+    EXPECT_EQ(doc.allocator().bytes_in_use(),empty_bytes);
+    ASSERT_EQ(doc.map_set_string("root","key","value"),Status::kOk);
+    const auto bytes=doc.allocator().bytes_in_use();
+    const auto clock=doc.next_clock();
+    auto* root=doc.find_map("root"); ASSERT_NE(root,nullptr);
+    for (std::uint32_t i=0u;i<8u;++i) {
+        EXPECT_EQ(readonly.find_map("root"),root);
+        EXPECT_EQ(doc.find_map(sv("missing")),nullptr);
+    }
+    EXPECT_EQ(doc.next_clock(),clock);
+    EXPECT_EQ(doc.allocator().bytes_in_use(),bytes);
+    const auto* item=root->get(sv("key")); ASSERT_NE(item,nullptr);
+    EXPECT_EQ(item->content_view.size,5u);
+}
+
 TEST(YcppDoc, LocalSetThenGetReturnsValue) {
     DocA doc{1};
     ASSERT_EQ(doc.map_set_string("root", "title", "Hello"), Status::kOk);
