@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Preserve deleted items when another item's origin points anywhere inside
+  their clock range, including the last UTF-16 clock used by map overwrites.
+  Compaction previously protected only the starting clock, allowing full
+  replay to lose a current map entry while retaining the same state vector.
+  Deleted intermediate items also retain the anchors needed to replay their
+  successor chain. Unreferenced payloads remain eligible for compaction.
+- Add overwrite-chain replay/convergence coverage and qualify all 19 local
+  Clang suites with assertions and warnings-as-errors enabled. Fix unsigned
+  pool-test arguments and remove unused test helpers for that build.
+
 ## 0.0.4 — UndoManager, GC, Y.Text delta, sub-docs, Y.Move, updateV2 surface
 
 New surfaces:

@@ -372,7 +372,7 @@ public:
                     if ((it->flags & kFlagDeleted) == 0) continue;
                     if (it->content_kind == ContentKind::kSkip) continue;
                     if (it->content_kind == ContentKind::kGc)   continue;
-                    if (is_origin_referent(it->id)) continue;  // still anchoring something
+                    if (is_origin_referent(*it)) continue;  // still anchoring something
 
                     it->content_kind = ContentKind::kSkip;
                     it->content_view = ByteView{};
@@ -383,10 +383,11 @@ public:
     }
 
 private:
-    // True if any live item in the store references `target` via its
+    // True if any item in the store references `target` via its
     // origin_left or origin_right. Conservative — bounded by total
     // items.
-    [[nodiscard]] bool is_origin_referent(Id target) const noexcept {
+    [[nodiscard]] bool is_origin_referent(const Item& target) const noexcept {
+        assert((target.flags & kFlagDeleted) != 0); assert(is_valid(target.id));
         bool found = false;
         store_.for_each_client(
             [&](uint64_t /*client*/, const Item* const* items,
@@ -404,9 +405,14 @@ private:
         return found;
     }
 
-    [[nodiscard]] static bool id_range_contains(Id origin, Id target) noexcept {
-        if (!is_valid(origin)) return false;
-        return origin == target;
+    [[nodiscard]] static bool id_range_contains(Id origin, const Item& target) noexcept {
+        assert((target.flags & kFlagDeleted) != 0); assert(is_valid(target.id));
+        if (!is_valid(origin) || origin.client != target.id.client || origin.clock < target.id.clock) return false;
+        // Yjs origins may reference any UTF-16 clock inside an Item (map
+        // overwrite uses the predecessor's last clock). Subtraction avoids
+        // overflowing when an Item ends at the largest representable clock.
+        const auto span = target.length == 0 ? uint64_t{1} : target.length;
+        return origin.clock - target.id.clock < span;
     }
 
 public:

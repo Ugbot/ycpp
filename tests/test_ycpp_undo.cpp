@@ -17,14 +17,6 @@ using ycpp::Status;
 using ycpp::UndoManager;
 using DocA = ycpp::Doc<DefaultArenaAllocator>;
 
-namespace {
-
-ByteView sv(const char* s) noexcept {
-    return ByteView{reinterpret_cast<const uint8_t*>(s), std::strlen(s)};
-}
-
-} // namespace
-
 TEST(YcppUndo, TrackedCaptureUndoRedoCycle) {
     DocA doc{/*client_id=*/1};
     UndoManager<DefaultArenaAllocator> um{doc};

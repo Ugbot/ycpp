@@ -192,9 +192,9 @@ TEST(YcppConvergence, DivergentOverwriteBranchesConverge) {
     }
 }
 
-// A late concurrent overwrite whose origin was compacted on the receiver
-// must still land on its map key.
-TEST(YcppConvergence, LateOverwriteOfCompactedOriginKeepsKey) {
+// A late concurrent overwrite must converge while compaction retains the
+// complete origin chain needed by existing and newly arriving map values.
+TEST(YcppConvergence, LateOverwriteRetainsOriginAnchorsAndKeepsKey) {
     DocA base{5};
     DocA a{1};
     DocA c{3};
@@ -208,7 +208,9 @@ TEST(YcppConvergence, LateOverwriteOfCompactedOriginKeepsKey) {
     ASSERT_EQ(c.map_set_string("r", "k", "c1"), Status::kOk);
 
     ASSERT_EQ(sync(a, base), Status::kOk);
-    EXPECT_GE(base.compact(), 1U);
+    // a2 references the last clock of the deleted a1 string; a1 in turn
+    // references x. Both anchors must survive, even though both are deleted.
+    EXPECT_EQ(base.compact(), 0U);
     ASSERT_EQ(sync(c, base), Status::kOk);
     EXPECT_EQ(head_of(base, "r", "k"), std::string_view{"c1"});
 

@@ -25,10 +25,6 @@ using SvA  = ycpp::StateVector<DefaultArenaAllocator>;
 
 namespace {
 
-ByteView sv(const char* s) noexcept {
-    return ByteView{reinterpret_cast<const uint8_t*>(s), std::strlen(s)};
-}
-
 std::string text_of(const ycpp::YText<DefaultArenaAllocator>& t) {
     std::string out;
     t.for_each_chunk([&](ByteView b) noexcept {

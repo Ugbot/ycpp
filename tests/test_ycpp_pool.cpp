@@ -27,7 +27,7 @@ TEST(YcppPool, AcquireConstructsAndCountsLive) {
     DefaultArenaAllocator a;
     Pool<Node, DefaultArenaAllocator> p{&a, 8};
 
-    Node* n = p.acquire(42);
+    Node* n = p.acquire(uint64_t{42});
     ASSERT_NE(n, nullptr);
     EXPECT_EQ(n->x, 42U);
     EXPECT_EQ(n->y, 84U);
@@ -40,9 +40,9 @@ TEST(YcppPool, AcquireConstructsAndCountsLive) {
 TEST(YcppPool, ReleaseRecyclesSlot) {
     DefaultArenaAllocator a;
     Pool<Node, DefaultArenaAllocator> p{&a, 4};
-    Node* first = p.acquire(1);
+    Node* first = p.acquire(uint64_t{1});
     p.release(first);
-    Node* again = p.acquire(2);
+    Node* again = p.acquire(uint64_t{2});
     EXPECT_EQ(again, first);  // freelist LIFO returns the just-released slot
     p.release(again);
 }
